@@ -104,16 +104,22 @@ const (
 // its timeout. They're written into each agent node of a plan.
 var AgentOptions = plan.Options{Timeout: 20 * time.Minute, Heartbeat: 5 * time.Minute}
 
-// AgentCommand is the agent step: Args[0] is the instruction, and every
-// upstream output is an input file. Its output is the AgentResult as JSON.
-// After every command it heartbeats its progress to Temporal.
+// AgentCommand is the agent step: Args[0] is the instruction, any more
+// arguments are the connectors and tools it may use ("linear",
+// "linear/search_issues": see ParseGrant), and every upstream output is an
+// input file. Its output is the AgentResult as JSON. After every command
+// it heartbeats its progress to Temporal.
 func AgentCommand(a Agent) weft.Arrow[plan.Input, string] {
 	return func(ctx context.Context, in plan.Input) (string, error) {
 		a := a // each step gets its own copy: steps run concurrently
-		if len(in.Args) != 1 {
-			return "", temporal.NewNonRetryableApplicationError("agent needs exactly one instruction", "InvalidInput", nil)
+		if len(in.Args) < 1 {
+			return "", temporal.NewNonRetryableApplicationError("agent needs an instruction", "InvalidInput", nil)
 		}
-		return Step(ctx, a, Question{Instruction: in.Args[0], Sources: sources(in.Upstream, pageSource)})
+		g, err := ParseGrant(in.Args[1:])
+		if err != nil {
+			return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
+		}
+		return Step(ctx, a, Question{Instruction: in.Args[0], Sources: sources(in.Upstream, pageSource), Grant: g})
 	}
 }
 
@@ -147,24 +153,27 @@ func Step(ctx context.Context, a Agent, q Question) (string, error) {
 	return string(b), err
 }
 
-// AgentBuiltinSpec is the draft builtin: exactly one string, the
-// instruction, with AgentOptions.
+// AgentBuiltinSpec is the draft builtin: the instruction, then any
+// connectors and tools the step may use, with AgentOptions.
 func AgentBuiltinSpec() registry.BuiltinSpec {
 	return registry.BuiltinSpec{
 		Name:      AgentCommandName,
 		AgentID:   AgentActivityName,
-		ArgSchema: registry.ArgSchema{Params: []registry.ParamSpec{{Name: "instruction", Type: registry.StringT}}},
+		ArgSchema: registry.ArgSchema{Params: []registry.ParamSpec{{Name: "instruction", Type: registry.StringT}}, Variadic: true, VariadicType: registry.StringT},
 		Backends:  []registry.Backend{registry.BackendTemporal},
 		Options:   AgentOptions,
 	}
 }
 
-// RegisterAgent adds agent to a draft registry and its activity to a worker.
+// RegisterAgent adds agent to a draft registry, and its activity and the
+// activity that runs its queued writes (WriteActivityName, for loom) to a
+// worker. The write activity is no draft command: no program can call it.
 func RegisterAgent(reg *registry.Registry, w Activities, a Agent) error {
 	if err := reg.Register(AgentBuiltinSpec()); err != nil {
 		return err
 	}
 	w.RegisterActivityWithOptions(shuttle.ArrowAsActivity(AgentCommand(a)), activity.RegisterOptions{Name: AgentActivityName})
+	w.RegisterActivityWithOptions(a.RunWrite, activity.RegisterOptions{Name: WriteActivityName})
 	return nil
 }
 

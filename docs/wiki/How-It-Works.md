@@ -115,6 +115,39 @@ A reply cut off at the output limit (`max_tokens`) may hold a half-written comma
 
 The session's disk, memory and CPU are bobbin's: the hardening flags limit memory and processes, and its writable layer is on the worker's disk, so give workers disk to spare.
 
+### Connectors
+
+A worker can offer agent steps MCP servers: connectors. Each one is named in the worker's connectors file (`-connectors FILE` on `loom worker` and `drawdown`, or `Agent.Connectors` in Go), and a step uses only what its own arguments grant it:
+
+```lisp
+(agent "Summarize this week's open bugs, then email the summary to the team." "linear/search_issues" "mail")
+```
+
+```json
+{"connectors": [
+  {"name": "linear", "url": "https://mcp.linear.app/mcp", "tokenEnv": "LINEAR_TOKEN", "tools": ["search_issues", "get_issue", "create_issue"], "writes": ["create_issue"]},
+  {"name": "mail", "image": "ghcr.io/acme/mail-mcp@sha256:5b0b8e2b9f1c4f3a6d7e8c9b0a1f2e3d4c5b6a7980f1e2d3c4b5a69788796a5b", "command": ["mail-mcp", "--stdio"],
+   "secrets": {"SMTP_PASSWORD": "MAIL_SMTP_PASSWORD"}, "writes": ["send"], "approve": true}
+]}
+```
+
+[[/images/connectors.svg|alt=A step's grant narrowed by the worker's; then remote reads through Anthropic's MCP connector, side by side with a local server's tools in its own container, side by side with writes, which are only queued; then, after the run's steps, each queued write runs once, after approval if it needs it, and the record keeps them all]]
+
+| | Remote connector | Local connector |
+|---|---|---|
+| Is | An `https://` MCP server (`url`) | A content-pinned image and the command that starts its server over standard input and output (`image`, `command`) |
+| Runs | Through [Anthropic's MCP connector](https://docs.claude.com/en/docs/agents-and-tools/mcp-connector) (the `mcp-client-2025-11-20` beta): the Messages API calls the server | In a bobbin session of its own, never the agent's, with no network; pirn speaks to it with the [official Go MCP SDK](https://github.com/modelcontextprotocol/go-sdk) and offers its tools to Claude as tools named `<connector>__<tool>` |
+| Credentials | `tokenEnv`: the worker's variable holding its OAuth token, sent as the server's `authorization_token` | `secrets`: container variables taken from the worker's variables, given to podman by name only, never on its command line |
+| Tools a step gets | An allowlist (`default_config` off, each granted tool on), or every tool but the writes when it's granted the whole connector | Exactly the granted tools the server lists |
+
+**Grants only narrow.** A step's arguments after the instruction are its grant: `linear` is every tool of the connector `linear`, `linear/search_issues` one of them (`ParseGrant`). The worker's grant is its connectors, with their `tools` if listed (`Connectors.Grant`). A step gets their intersection (`Grant.Narrow`), and must ask for nothing more: a step asking for a connector or a tool the worker doesn't offer fails as setup (`AgentSetup`) before Claude is asked. Narrowing allows a tool exactly when both grants do, and is commutative, associative and idempotent (`TestLaw_GrantsOnlyNarrow`, `FuzzGrantNarrowing`), so a grant is a list of caveats that only ever remove: a step, or later a sub-agent, only ever gets less. A step that asks for nothing gets no connector at all.
+
+**Writes run once.** A tool listed in `writes` changes something outside the run: an email, an issue. A step never runs one, because a step can be retried and Claude asked again. When Claude calls a write, it's queued (`AgentResult.Writes`, at most 20 a step, each input at most 16 KiB of JSON) and Claude is told so. A remote connector's writes are switched off in its toolset, so the Messages API never runs them; pirn lists their schemas from the server itself, with the token, and offers them as tools that only queue. After the run's steps, loom runs each queued write once (`RunWrite`, one attempt: a failure, even one whose outcome is unknown, is never retried), first waiting for a person to approve it if its connector says `approve` ([loom → Writes](https://github.com/heedle-ai/loom/wiki/How-It-Works#writes)). A later step in the same run doesn't see a write's result.
+
+**Every call is recorded.** `AgentResult.Tools` lists every connector call: its tool, input and output (each cut at 4 KiB), and whether Anthropic's MCP connector made it (`remote`), pirn did, or it was queued (`write`). `AgentResult.Grant` is what the step was granted. Tokens and secrets are never in a plan, an output, a record or a log; the remote server's token is in the request to the Messages API, as the MCP connector needs. A step makes or queues at most 60 calls (`MaxToolCalls`); one call is bounded like a command (2 minutes), and Claude sees at most 8 KiB of its output.
+
+**Servers are bounded too.** Starting or reaching a server and listing its tools has a minute (`ListTimeout`); a server listing more than 100 tools (`MaxTools`) fails the step as setup, and a tool whose input schema is over 16 KiB (`MaxToolSchema`) is left out. pirn reads at most 32 MiB from any server (`MaxServerOutput`). A remote connector's token goes only to its own URL: pirn follows no redirect and speaks only https. Whether a write needs approval is the worker's connectors file's to say when the write runs, not the step's: `RunWrite` refuses a write whose connector says `approve` unless a person approved it.
+
 ## Laws
 
 `ask` is a `weft.Arrow`, registered the same way as reed's `browse` and bobbin's `container`, so it composes under `pipe` and `par` exactly as they do. Two law tests check it with a deterministic stand-in for Claude: weft's identity laws (`TestLaw_AskIsAWeftArrow`), and that the question is a function of the step's inputs alone (`TestLaw_PromptIsAFunctionOfInputs`). Claude's answers themselves can differ between runs, so the laws hold up to the answer, which is why every answer is recorded with what it was given.
@@ -124,3 +157,6 @@ The session's disk, memory and CPU are bobbin's: the hardening flags limit memor
 - **Answers differ between runs.** That's the nature of the model; the record keeps each answer with the sources it was given.
 - **Sources can try to steer Claude.** A page can contain text addressed to the model. The system prompt says to treat sources as data, and an ask step has no tools, so the most a page can do is distort the answer, which is recorded next to the page that did it.
 - **One model per worker.** Choosing the model in the program is **Planned**.
+- **Only agent steps use connectors.** An `ask` step has no tools, and a skill step gets no grant yet.
+- **The MCP connector isn't covered by zero data retention.** What a remote connector's tools return goes through Anthropic's API under its standard retention; use a local connector for data that mustn't.
+- **Local connectors have no network.** A server that must call an API should be a remote connector.

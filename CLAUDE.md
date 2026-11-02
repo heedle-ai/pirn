@@ -78,6 +78,13 @@ why the existing tool can't do it.
   retried in place so the session survives; anything else goes to Temporal. Container tests are
   `TestContainer_*`; CI's `containers` step runs them with
   `PIRN_REQUIRE_PODMAN=1`.
+- Agent steps use connectors (MCP servers) only as their arguments grant,
+  narrowed by the worker's connectors file (`Grant.Narrow`: a step only
+  ever gets less). Remote servers go through Anthropic's MCP connector;
+  local ones run in a bobbin session of their own, spoken to with the
+  official Go MCP SDK (`mcp.go` alone). A write tool is never run in a
+  step: it's queued, and loom runs it once after the run (`RunWrite`, one
+  attempt). Credentials are named, never written, and never recorded.
 - Tests use a stand-in Messages API (`httptest`), so they need no key.
   `TestLive_*` asks the real Claude when `ANTHROPIC_API_KEY` is set; it is not
   an invariant guard, because CI has no key.
