@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    # bash -eo pipefail: a failing command in a pipe fails the step
+    # (the default, bash -e, ignores it).
+    shell: bash
+
 jobs:
   test:
     strategy:
@@ -82,8 +88,9 @@ jobs:
           export PATH="$RUNNER_TEMP/bin:$PATH"
           cd "$GITHUB_WORKSPACE/pirn"
           go test -count=1 -v -run 'TestContainer_' . | tee containers.log
-          ! grep -q -- '--- SKIP' containers.log
+          if grep -q -- '--- SKIP' containers.log; then echo 'a test skipped'; exit 1; fi
           grep -q -- '--- PASS: TestContainer_AgentInARealSession' containers.log
           grep -q -- '--- PASS: TestContainer_AgentKeepsAwkwardFiles' containers.log
           grep -q -- '--- PASS: TestContainer_AgentKeepsLargeFilesInARegistry' containers.log
           grep -q -- '--- PASS: TestContainer_AgentFollowsASkill' containers.log
+          grep -q -- '--- PASS: TestContainer_LocalConnectorInARealSession' containers.log

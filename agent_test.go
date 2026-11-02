@@ -543,3 +543,66 @@ func TestContainer_AgentFollowsASkill(t *testing.T) {
 		t.Errorf("commands %+v, files %+v", res.Commands, res.Files)
 	}
 }
+
+var mcpImageOnce = sync.OnceValues(func() (string, error) {
+	base, err := shellImageOnce()
+	if err != nil {
+		return "", err
+	}
+	dir, err := os.MkdirTemp("", "pirn-mcp")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(dir)
+	build := exec.Command("go", "build", "-o", filepath.Join(dir, "mcpserver"), "./testdata/mcpserver")
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := build.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("go build: %v: %s", err, out)
+	}
+	cf := "FROM " + base + "\nCOPY mcpserver /bin/mcpserver\n"
+	os.WriteFile(filepath.Join(dir, "Containerfile"), []byte(cf), 0o644)
+	out, err := exec.Command("podman", "build", "--quiet", dir).Output()
+	if err != nil {
+		return "", fmt.Errorf("podman build: %v", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+})
+
+// TestContainer_LocalConnectorInARealSession: a real MCP server, built
+// with the official Go SDK, runs in a real container of its own, with its
+// secret from the worker's environment; the agent's granted read runs
+// there and its write is only queued; then RunWrite runs the write once,
+// in a fresh container, and no session is left behind.
+func TestContainer_LocalConnectorInARealSession(t *testing.T) {
+	img := shellImage(t)
+	srv, err := mcpImageOnce()
+	if err != nil {
+		if os.Getenv("PIRN_REQUIRE_PODMAN") == "1" {
+			t.Fatal(err)
+		}
+		t.Skip(err)
+	}
+	t.Setenv("FILES_TOKEN", "files-secret")
+	api := newScript(t,
+		turn("tool_use", `{"type":"tool_use","id":"t1","name":"files__search","input":{"query":"q3"}}`,
+			`{"type":"tool_use","id":"t2","name":"files__send","input":{"query":"to boss"}}`),
+		turn("end_turn", `{"type":"text","text":"Found it and queued the email."}`))
+	cs := pirn.Connectors{{Name: "files", Image: srv, Command: []string{"/bin/mcpserver"}, Secrets: map[string]string{"FAKE_TOKEN": "FILES_TOKEN"}, Writes: []string{"send"}}}
+	a := pirn.Agent{Claude: pirn.Claude{APIKey: "k", BaseURL: api.srv.URL}, Image: img, Connectors: cs}
+	g, _ := pirn.ParseGrant([]string{"files"})
+	res, err := a.Run(context.Background(), pirn.Question{Instruction: "Find and send.", Grant: g})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Tools) != 2 || res.Tools[0].Output != "found q3 with files-secret" || res.Tools[1].Write != "w1" || len(res.Writes) != 1 {
+		t.Fatalf("tools %+v, writes %+v", res.Tools, res.Writes)
+	}
+	r, err := a.RunWrite(context.Background(), res.Writes[0])
+	if err != nil || r.Output != "sent to boss" {
+		t.Errorf("write: %+v %v", r, err)
+	}
+	out, _ := exec.Command("podman", "ps", "--all", "--filter", "label="+bobbin.SessionLabel, "--format", "{{.Names}}").Output()
+	if strings.TrimSpace(string(out)) != "" {
+		t.Errorf("sessions left: %s", out)
+	}
+}
