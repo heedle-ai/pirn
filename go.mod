@@ -4,6 +4,7 @@ go 1.24.0
 
 // Until the heedle-ai modules are published, build against sibling checkouts.
 replace (
+	github.com/heedle-ai/bobbin => ../bobbin
 	github.com/heedle-ai/draft => ../draft
 	github.com/heedle-ai/reed => ../reed
 	github.com/heedle-ai/shuttle => ../shuttle
@@ -12,6 +13,7 @@ replace (
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.80.0
+	github.com/heedle-ai/bobbin v0.0.0
 	github.com/heedle-ai/draft v0.0.0
 	github.com/heedle-ai/reed v0.0.0
 	github.com/heedle-ai/shuttle v0.0.0

@@ -1,4 +1,4 @@
-**pirn** gives agent steps Claude. Each `(ask "…")` step sends its upstream outputs to Claude as sources, with the instruction, and records what Claude answered: the text, the model, why it stopped and how many tokens it used.
+**pirn** gives agent steps Claude. Each `(agent "…")` step has Claude do the work in a fresh container, with every command recorded; each `(ask "…")` step sends its upstream outputs to Claude as sources, with the instruction, and records what Claude answered: the text, the model, why it stopped and how many tokens it used.
 
 ```lisp
 (pipe

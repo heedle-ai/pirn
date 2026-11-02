@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
@@ -89,4 +90,77 @@ func Register(reg *registry.Registry, w Activities, a Asker) error {
 	}
 	w.RegisterActivityWithOptions(shuttle.ArrowAsActivity(Command(a)), activity.RegisterOptions{Name: ActivityName})
 	return nil
+}
+
+const (
+	// AgentCommandName is the draft command: (agent "instruction").
+	AgentCommandName = "agent"
+	// AgentActivityName is its Temporal activity.
+	AgentActivityName = "Agent"
+)
+
+// AgentOptions are how agent steps run: long enough for an agent to work,
+// with a heartbeat after every command, so a hung step is retried before
+// its timeout. They're written into each agent node of a plan.
+var AgentOptions = plan.Options{Timeout: 20 * time.Minute, Heartbeat: 5 * time.Minute}
+
+// AgentCommand is the agent step: Args[0] is the instruction, and every
+// upstream output is an input file. Its output is the AgentResult as JSON.
+// After every command it heartbeats its progress to Temporal.
+func AgentCommand(a Agent) weft.Arrow[plan.Input, string] {
+	return func(ctx context.Context, in plan.Input) (string, error) {
+		a := a // each step gets its own copy: steps run concurrently
+		if len(in.Args) != 1 {
+			return "", temporal.NewNonRetryableApplicationError("agent needs exactly one instruction", "InvalidInput", nil)
+		}
+		if activity.IsActivity(ctx) {
+			a.OnProgress = func(r AgentResult) { activity.RecordHeartbeat(ctx, len(r.Commands)) }
+		}
+		q := Question{Instruction: in.Args[0], Sources: sources(in.Upstream, pageSource)}
+		res, err := a.Run(ctx, q)
+		var wait *RetryAfter
+		switch {
+		case ctx.Err() != nil && err != nil:
+			return "", err
+		case errors.Is(err, ErrInvalid):
+			return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
+		case errors.Is(err, ErrSetup):
+			return "", temporal.NewNonRetryableApplicationError(err.Error(), "AgentSetup", nil)
+		case errors.As(err, &wait):
+			return "", temporal.NewApplicationErrorWithOptions(err.Error(), "RateLimited", temporal.ApplicationErrorOptions{NextRetryDelay: wait.Delay})
+		case err != nil:
+			return "", err // retryable, in a fresh session
+		}
+		b, err := json.Marshal(res)
+		return string(b), err
+	}
+}
+
+// AgentBuiltinSpec is the draft builtin: exactly one string, the
+// instruction, with AgentOptions.
+func AgentBuiltinSpec() registry.BuiltinSpec {
+	return registry.BuiltinSpec{
+		Name:      AgentCommandName,
+		AgentID:   AgentActivityName,
+		ArgSchema: registry.ArgSchema{Params: []registry.ParamSpec{{Name: "instruction", Type: registry.StringT}}},
+		Backends:  []registry.Backend{registry.BackendTemporal},
+		Options:   AgentOptions,
+	}
+}
+
+// RegisterAgent adds agent to a draft registry and its activity to a worker.
+func RegisterAgent(reg *registry.Registry, w Activities, a Agent) error {
+	if err := reg.Register(AgentBuiltinSpec()); err != nil {
+		return err
+	}
+	w.RegisterActivityWithOptions(shuttle.ArrowAsActivity(AgentCommand(a)), activity.RegisterOptions{Name: AgentActivityName})
+	return nil
+}
+
+// ParseAgent reads an agent output back. ok is false when out isn't one.
+func ParseAgent(out string) (r AgentResult, ok bool) {
+	if json.Unmarshal([]byte(out), &r) != nil || r.Agent != 1 || r.Pirn != 1 || r.Model == "" {
+		return AgentResult{}, false
+	}
+	return r, true
 }

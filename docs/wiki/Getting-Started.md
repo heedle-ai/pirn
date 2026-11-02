@@ -6,7 +6,7 @@ pirn builds against sibling checkouts of the other heedle-ai repos. bobbin, reed
 gh auth login        # once; bobbin, reed and pirn are private
 gh auth setup-git    # lets git clone them with your gh login
 mkdir -p ~/src/heedle-ai && cd ~/src/heedle-ai
-for r in weft draft shuttle reed pirn; do git clone https://github.com/heedle-ai/$r.git; done
+for r in weft draft shuttle bobbin reed pirn; do git clone https://github.com/heedle-ai/$r.git; done
 cd pirn
 go test -race ./...
 ```
@@ -49,7 +49,18 @@ The two pages are fetched in parallel, each in a fresh browser that may reach on
 
 On macOS, reed's browser image must be built inside Linux, which reed lists as **Planned**; `ask` itself works on both.
 
-## 4. In Go
+## 4. Agent steps
+
+An agent needs an image with a shell. Any content-pinned image with `/bin/sh` and a writable `/work` (or one root can create) works: build your own with the tools your agents need, then give its ID to the worker:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-... go run ./cmd/loom worker -store ~/heedle-store.git -agent-image <image ID>
+go run ./cmd/loom run '(agent "Write out/primes.txt with the primes below 100, one per line.")'
+```
+
+pirn's own tests build a small one, `FROM scratch` with a static busybox (`apt-get install busybox-static` on Debian or Ubuntu), in `agent_test.go`.
+
+## 5. In Go
 
 ```go
 reg := draft.DefaultRegistry()

@@ -15,11 +15,15 @@ import (
 // TestInv_OnlyTheSDKTalksToClaude: pirn's code imports an allowlist. The
 // Messages API is reached only through Anthropic's SDK, and pirn starts no
 // processes and opens no files or sockets of its own: no os, net or
-// net/http, so only the SDK can make a request.
+// net/http, so only the SDK can make a request, and only bobbin (Podman)
+// runs anything.
 func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 	allowed := map[string]bool{
 		"context": true, "encoding/json": true, "errors": true, "fmt": true,
 		"regexp": true, "sort": true, "strconv": true, "strings": true, "time": true,
+		"encoding/base64": true, "unicode/utf8": true,
+		// Agent steps run their commands only through bobbin's sessions.
+		"github.com/heedle-ai/bobbin":            true,
 		"github.com/anthropics/anthropic-sdk-go": true, "github.com/anthropics/anthropic-sdk-go/option": true,
 		"go.temporal.io/sdk/activity": true, "go.temporal.io/sdk/temporal": true,
 		"github.com/heedle-ai/draft/registry": true, "github.com/heedle-ai/reed": true,
