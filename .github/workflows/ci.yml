@@ -71,7 +71,18 @@ jobs:
         run: |
           sudo apt-get update >/dev/null
           sudo apt-get install -y busybox-static >/dev/null
+          # oras and the distribution project's registry, pinned by hash,
+          # for the large-file test.
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP"
+          curl -sSfLo oras.tgz https://github.com/oras-project/oras/releases/download/v1.2.3/oras_1.2.3_linux_amd64.tar.gz
+          curl -sSfLo reg.tgz https://github.com/distribution/distribution/releases/download/v3.0.0/registry_3.0.0_linux_amd64.tar.gz
+          echo "b4efc97a91f471f323f193ea4b4d63d8ff443ca3aab514151a30751330852827  oras.tgz" | sha256sum -c
+          echo "61c9a2c0d5981a78482025b6b69728521fbc78506d68b223d4a2eb825de5ca3d  reg.tgz" | sha256sum -c
+          tar -xzf oras.tgz -C bin oras && tar -xzf reg.tgz -C bin registry
+          export PATH="$RUNNER_TEMP/bin:$PATH"
+          cd "$GITHUB_WORKSPACE/pirn"
           go test -count=1 -v -run 'TestContainer_' . | tee containers.log
           ! grep -q -- '--- SKIP' containers.log
           grep -q -- '--- PASS: TestContainer_AgentInARealSession' containers.log
           grep -q -- '--- PASS: TestContainer_AgentKeepsAwkwardFiles' containers.log
+          grep -q -- '--- PASS: TestContainer_AgentKeepsLargeFilesInARegistry' containers.log

@@ -13,15 +13,16 @@ import (
 )
 
 // TestInv_OnlyTheSDKTalksToClaude: pirn's code imports an allowlist. The
-// Messages API is reached only through Anthropic's SDK, and pirn starts no
-// processes and opens no files or sockets of its own: no os, net or
-// net/http, so only the SDK can make a request, and only bobbin (Podman)
-// runs anything.
+// Messages API is reached only through Anthropic's SDK, and pirn opens no
+// sockets of its own: no net or net/http, so only the SDK can make a
+// request. Only bobbin (Podman) runs an agent's commands. The one
+// exception is registry.go, which alone may run a process and touch files:
+// oras, on a temporary copy of a file too big for the record.
 func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 	allowed := map[string]bool{
 		"context": true, "encoding/json": true, "errors": true, "fmt": true,
 		"regexp": true, "sort": true, "strconv": true, "strings": true, "time": true,
-		"encoding/base64": true, "unicode/utf8": true,
+		"encoding/base64": true, "unicode/utf8": true, "crypto/sha256": true, "encoding/hex": true, "io": true, "bytes": true,
 		// Agent steps run their commands only through bobbin's sessions.
 		"github.com/heedle-ai/bobbin":            true,
 		"github.com/anthropics/anthropic-sdk-go": true, "github.com/anthropics/anthropic-sdk-go/option": true,
@@ -41,7 +42,7 @@ func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 		}
 		for _, im := range af.Imports {
 			p, _ := strconv.Unquote(im.Path.Value)
-			if !allowed[p] {
+			if !allowed[p] && !(f == "registry.go" && (p == "os" || p == "os/exec" || p == "path/filepath")) {
 				bad = append(bad, f+": "+p)
 			}
 		}

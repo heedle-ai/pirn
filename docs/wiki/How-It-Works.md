@@ -89,9 +89,21 @@ The step's output is the result as JSON (`pirn.AgentResult`): Claude's reply, mo
 | One command | 2 minutes (`CommandTimeout`); a command past it is stopped with every other process in the session, so it can't change files later |
 | Output Claude sees | 8 KiB of each command's output (`ClaudeOutput`), so a noisy command can't fill its context; a silent command is "(no output)" |
 | Each command's output kept in the record | 4 KiB of standard output and of standard error, marked when cut |
-| Files kept from `/work/out` | 20 files, 256 KiB each, 512 KiB in all, any file name; the rest, and unreadable files, are listed as skipped (20 named, then a count) |
+| Files kept from `/work/out` | 20 files, any file name. In the record: 256 KiB each, 512 KiB in all. With a registry (below), a larger file goes there instead: 4 GiB each, 16 GiB a step. The rest, and unreadable files, are listed as skipped (20 named, then a count) |
 | Changes listed | 500 |
 | The whole result | under 1 MiB (`MaxResult`), well inside Temporal's 2 MB payload limit: if escaping makes it larger, recorded output is cut further, then files are dropped |
+
+### Large files
+
+A worker given a registry (`-agent-registry ghcr.io/acme/heedle-files` on `loom worker` and `drawdown`, or `Agent.Registry` in Go) keeps a file too big for the record in that OCI registry instead of skipping it. The file is streamed out of the session (bobbin's `ReadTo`) to a temporary file on the worker, hashed, and pushed with [oras](https://oras.land) (1.2 or newer, on the worker's `PATH`) as one artifact whose only layer is the file, so the layer's digest is the file's own SHA-256. The tag is `sha256-<hex>`, so registries that delete untagged manifests keep it. oras uses the worker's own login (`oras login`, or Docker's credentials); the step never sees it.
+
+The record keeps the file's path, size, SHA-256 and repository (`oci`), never its bytes; loom writes those to `files/<node>/<path>` as a small pointer. To get the file back:
+
+```bash
+oras blob fetch --output stories.csv ghcr.io/acme/heedle-files@sha256:<sha256>
+```
+
+A file the registry refuses (no login, no space) is listed as skipped, with oras's reason, rather than failing the step, since a retry would rerun the whole agent. The temporary copy is removed as soon as it's pushed; give workers disk for the largest file (4 GiB). The step heartbeats while copying and pushing. Before any of this, every process the agent left running is stopped, so nothing changes `/work/out` while it is read.
 
 A reply cut off at the output limit (`max_tokens`) may hold a half-written command, so its commands aren't run and Claude is told why. A rate limit or overload mid-step is retried in place (three tries, waiting as long as `Retry-After` asks, up to a minute), so the session and the work in it are kept; after that the error goes to Temporal, which retries the step from the start.
 
