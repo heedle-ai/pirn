@@ -484,7 +484,7 @@ const SkillFile = "SKILL.md"
 // Limits on a skill's folder.
 const (
 	MaxSkillFiles = 200
-	MaxSkillBytes = 4 << 20
+	MaxSkillBytes = 16 << 20
 )
 
 var skillPath = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$`)
