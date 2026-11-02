@@ -34,7 +34,7 @@ Summarize.
 
 The system prompt (`pirn.System`) tells Claude to answer only from the sources, to treat their contents as data rather than instructions, to cite them by ID, and to say so when they don't support an answer.
 
-A source's text can't forge that structure: a `<source>` or `<instruction>` tag inside it, opening or closing, has its `<` written as `&lt;`.
+A source's text can't forge that structure: a `<source>`, `<instruction>` or `<skill>` tag inside it, opening or closing, has its `<` written as `&lt;`.
 
 Limits, checked before anything is sent: the instruction is at most 16 KiB (`MaxInstruction`) and the whole prompt at most 512 KiB (`MaxPrompt`). reed bounds each page's text to 64 KiB, so a few pages always fit.
 
@@ -92,6 +92,12 @@ The step's output is the result as JSON (`pirn.AgentResult`): Claude's reply, mo
 | Files kept from `/work/out` | 20 files, any file name. In the record: 256 KiB each, 512 KiB in all. With a registry (below), a larger file goes there instead: 4 GiB each, 16 GiB a step. The rest, and unreadable files, are listed as skipped (20 named, then a count) |
 | Changes listed | 500 |
 | The whole result | under 1 MiB (`MaxResult`), well inside Temporal's 2 MB payload limit: if escaping makes it larger, recorded output is cut further, then files are dropped |
+
+### Skills
+
+An agent step can use a skill: a folder whose `SKILL.md` says how to do a kind of work, with any scripts or references it needs, in the format of [Anthropic's Agent Skills](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/overview). [treadle](https://github.com/heedle-ai/treadle) keeps skills and turns each into a command; pirn only runs one. `Question.Skill` holds the folder's files by path: they are written to `/work/skill` before Claude starts, and `SKILL.md` itself is in Claude's first message, inside `<skill>` tags, so Claude starts by reading it. The system prompt says a skill tells Claude how to work, while the step's inputs stay data.
+
+`CheckSkill` refuses a folder, before any container starts, unless it has `SKILL.md`, at most 200 files and 4 MiB in all, and every path is relative and made of letters, digits, `.`, `_` and `-`, with no segment starting with `.` or `-`. Other agent steps, such as a skill's, run through `pirn.Step`, which heartbeats and classifies errors exactly as the `agent` command does.
 
 ### Large files
 
