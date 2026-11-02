@@ -57,21 +57,56 @@ func (r *Registry) oras() string {
 	return "oras"
 }
 
+// Created is the creation time every manifest is pushed with, so the same
+// file always gives the same manifest: pushing it again changes nothing.
+const Created = "1970-01-01T00:00:00Z"
+
 // PushArgv is the oras command line that keeps a file, saved as "content"
 // in its working directory, whose SHA-256 is sum.
 func (r *Registry) PushArgv(sum string) []string {
-	argv := []string{"push", "--format", "json", "--artifact-type", FileType}
+	argv := []string{"push", "--format", "json", "--artifact-type", FileType, "--annotation", "org.opencontainers.image.created=" + Created}
 	if r.PlainHTTP {
 		argv = append(argv, "--plain-http")
 	}
 	return append(argv, r.Repo+":sha256-"+sum, "content:application/octet-stream")
 }
 
-// push keeps the file at path (named "content"), whose SHA-256 is sum, and
-// checks that the registry holds it under that digest.
+// HasArgv are the oras command lines that check whether the registry
+// already keeps the file whose SHA-256 is sum: its tag resolves, and its
+// blob is there.
+func (r *Registry) HasArgv(sum string) [][]string {
+	plain := []string{}
+	if r.PlainHTTP {
+		plain = []string{"--plain-http"}
+	}
+	return [][]string{
+		append(append([]string{"resolve"}, plain...), r.Repo+":sha256-"+sum),
+		append(append([]string{"blob", "fetch", "--descriptor"}, plain...), r.Repo+"@sha256:"+sum),
+	}
+}
+
+// has reports whether the registry already keeps the file whose SHA-256 is
+// sum, as a retried step's earlier attempt may have left it.
+func (r *Registry) has(ctx context.Context, sum string) bool {
+	for _, argv := range r.HasArgv(sum) {
+		cmd := exec.CommandContext(ctx, r.oras(), argv...)
+		if cmd.Run() != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// push keeps the file at path (named "content"), whose SHA-256 is sum,
+// unless the registry already has it: then nothing is pushed, so a
+// registry whose tags can't be overwritten accepts a retried step too.
+// It checks that oras reports where it put the file.
 func (r *Registry) push(ctx context.Context, path, sum string) error {
 	if filepath.Base(path) != "content" {
 		return fmt.Errorf("pirn: registry: %s isn't named content", path)
+	}
+	if r.has(ctx, sum) {
+		return nil
 	}
 	cmd := exec.CommandContext(ctx, r.oras(), r.PushArgv(sum)...)
 	cmd.Dir = filepath.Dir(path)
@@ -92,8 +127,12 @@ func (r *Registry) push(ctx context.Context, path, sum string) error {
 	return nil
 }
 
-// FetchCommand is the command that writes a kept file back out, to file.
+// FetchCommand is the command that writes a kept file back out, to file
+// (as ./file if it starts with "-", which oras reads as standard output).
 func FetchCommand(repo, sum, file string) string {
+	if strings.HasPrefix(file, "-") {
+		file = "./" + file
+	}
 	return fmt.Sprintf("oras blob fetch --output %s %s@sha256:%s", shellQuote(file), repo, sum)
 }
 

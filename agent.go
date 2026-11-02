@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -48,6 +49,12 @@ const (
 	// MaxResult bounds a step's whole recorded result, encoded: well under
 	// Temporal's 2 MB payload limit.
 	MaxResult = 1 << 20
+	// StopTries is how often the leftover processes are stopped before
+	// /work/out is collected anyway.
+	StopTries = 3
+	// CollectTimeout bounds keeping files in a registry, within the step's
+	// own timeout: past it, the rest are skipped.
+	CollectTimeout = 5 * time.Minute
 	// InDir and OutDir are where a step's inputs are put and where its
 	// results are collected.
 	InDir  = "/work/in"
@@ -122,6 +129,8 @@ type Agent struct {
 	// Registry, if set, keeps files in /work/out too big for the record;
 	// without it they are listed as skipped.
 	Registry *Registry
+	// CollectTimeout overrides the package's CollectTimeout when set.
+	CollectTimeout time.Duration
 }
 
 func (a Agent) beat(res *AgentResult) {
@@ -243,8 +252,17 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 		res.Text = "(Claude ended without a reply.)"
 	}
 	// Nothing the agent started may change /work/out while it's collected.
-	if err := s.Stop(ctx); err != nil {
-		return res, err
+	// A busy session can make one stop fail; after StopTries the files are
+	// collected anyway, with a note, rather than failing a finished step.
+	stopped := false
+	for i := 0; i < StopTries && !stopped; i++ {
+		stopped = s.Stop(ctx) == nil
+	}
+	if ctx.Err() != nil {
+		return res, ctx.Err()
+	}
+	if !stopped {
+		skip(&res, "note: the agent's leftover processes couldn't be stopped, so files may have changed while they were collected")
 	}
 	if err := a.collect(ctx, s, &res); err != nil {
 		return res, err
@@ -368,13 +386,21 @@ func (a Agent) collect(ctx context.Context, s *bobbin.Session, res *AgentResult)
 		skip(res, "some files: too many names to list")
 	}
 	sort.Strings(paths)
-	total, large := 0, int64(0)
+	total, large, seen := 0, int64(0), 0
+	limit := CollectTimeout
+	if a.CollectTimeout > 0 {
+		limit = a.CollectTimeout
+	}
+	cctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
 	for _, p := range paths {
 		rel := strings.TrimPrefix(p, "./")
 		if rel == "" {
 			continue
 		}
-		if len(res.Files) >= MaxOutFiles {
+		// Every file looked at counts, kept or not, so skipped large files
+		// can't make collecting take ever longer.
+		if seen++; seen > MaxOutFiles {
 			skip(res, rel+": more than "+fmt.Sprint(MaxOutFiles)+" files")
 			continue
 		}
@@ -387,7 +413,7 @@ func (a Agent) collect(ctx context.Context, s *bobbin.Session, res *AgentResult)
 				skip(res, rel+": larger than 256 KiB")
 				continue
 			}
-			if err := a.keepLarge(ctx, s, rel, res, &large); err != nil {
+			if err := a.keepLarge(ctx, cctx, s, rel, res, &large); err != nil {
 				return err
 			}
 			continue
@@ -408,7 +434,7 @@ func (a Agent) collect(ctx context.Context, s *bobbin.Session, res *AgentResult)
 				skip(res, rel+": past the 512 KiB kept in all")
 				continue
 			}
-			if err := a.keepLarge(ctx, s, rel, res, &large); err != nil {
+			if err := a.keepLarge(ctx, cctx, s, rel, res, &large); err != nil {
 				return err
 			}
 			continue
@@ -429,11 +455,34 @@ func (a Agent) collect(ctx context.Context, s *bobbin.Session, res *AgentResult)
 }
 
 // keepLarge copies one file out of the session and keeps it in the
-// registry, adding it to res.Files with its digest; a file past
-// MaxLargeFile or the step's MaxLargeBytes, or one the registry refuses,
-// is listed as skipped. Only a cancelled step is an error. It heartbeats
-// while copying and pushing, which can take minutes.
-func (a Agent) keepLarge(ctx context.Context, s *bobbin.Session, rel string, res *AgentResult, used *int64) error {
+// registry, adding it to res.Files with its digest. Its size is read
+// first, so a file past MaxLargeFile, or past what's left of the step's
+// MaxLargeBytes, is skipped without being copied; every byte copied counts
+// toward MaxLargeBytes, kept or not. A file the registry refuses, or one
+// still copying when cctx (CollectTimeout) ends, is listed as skipped.
+// Only a cancelled step (ctx) is an error. It heartbeats while copying and
+// pushing, which can take minutes.
+func (a Agent) keepLarge(ctx, cctx context.Context, s *bobbin.Session, rel string, res *AgentResult, used *int64) error {
+	left := min(int64(MaxLargeFile), MaxLargeBytes-*used)
+	why := map[bool]string{true: ": larger than 4 GiB", false: ": past the 16 GiB kept in a registry in all"}[left == MaxLargeFile]
+	ls, err := s.Exec(cctx, `ls -ln -- "$1"`, nil, OutDir+"/"+rel)
+	switch {
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case cctx.Err() != nil:
+		skip(res, rel+": out of time to keep it")
+		return nil
+	case err != nil || ls.ExitCode != 0:
+		skip(res, rel+": couldn't be read")
+		return nil
+	}
+	if f := strings.Fields(ls.Stdout); len(f) < 5 {
+		skip(res, rel+": couldn't be read")
+		return nil
+	} else if size, err := strconv.ParseInt(f[4], 10, 64); err != nil || size > left {
+		skip(res, rel+why)
+		return nil
+	}
 	path, f, done, err := tempContent()
 	if err != nil {
 		skip(res, rel+": no room on the worker: "+err.Error())
@@ -443,33 +492,36 @@ func (a Agent) keepLarge(ctx context.Context, s *bobbin.Session, rel string, res
 	stop := a.beatEvery(res, 20*time.Second)
 	defer stop()
 	h := sha256.New()
-	limit := min(int64(MaxLargeFile), MaxLargeBytes-*used)
-	n, err := s.ReadTo(ctx, OutDir+"/"+rel, io.MultiWriter(f, h), limit)
+	n, err := s.ReadTo(cctx, OutDir+"/"+rel, io.MultiWriter(f, h), left)
+	*used += n
 	if cerr := f.Close(); err == nil && cerr != nil {
 		err = cerr
 	}
 	switch {
 	case ctx.Err() != nil:
 		return ctx.Err()
-	case errors.Is(err, bobbin.ErrOutputTooLarge) && limit < MaxLargeFile:
-		skip(res, rel+": past the 16 GiB kept in a registry in all")
+	case cctx.Err() != nil:
+		skip(res, rel+": out of time to keep it")
 		return nil
 	case errors.Is(err, bobbin.ErrOutputTooLarge):
-		skip(res, rel+": larger than 4 GiB")
+		skip(res, rel+why)
 		return nil
 	case err != nil:
 		skip(res, rel+": couldn't be read")
 		return nil
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
-	if err := a.Registry.push(ctx, path, sum); err != nil {
-		if ctx.Err() != nil {
+	if err := a.Registry.push(cctx, path, sum); err != nil {
+		switch {
+		case ctx.Err() != nil:
 			return ctx.Err()
+		case cctx.Err() != nil:
+			skip(res, rel+": out of time to keep it")
+		default:
+			skip(res, rel+": the registry refused it: "+err.Error())
 		}
-		skip(res, rel+": the registry refused it: "+err.Error())
 		return nil
 	}
-	*used += n
 	res.Files = append(res.Files, File{Path: rel, Size: int(n), OCI: a.Registry.Repo, SHA256: sum})
 	return nil
 }
@@ -507,16 +559,19 @@ func skip(res *AgentResult, why string) {
 }
 
 // fit keeps the whole result under MaxResult, encoded, by dropping what's
-// least needed first: the largest kept files, then changed paths, then
-// the largest command outputs. It always ends.
+// least needed first: the largest files kept in the record (never one kept
+// in a registry), then changed paths, then the largest command outputs.
+// It always ends.
 func fit(res *AgentResult) {
 	size := func() int { b, _ := json.Marshal(res); return len(b) }
 	for size() > MaxResult {
 		switch {
-		case len(res.Files) > 0:
-			big, n := 0, 0
+		case inlineFiles(res) > 0:
+			// A file kept in a registry is never dropped: its pointer is
+			// tiny, and dropping it would orphan what was pushed.
+			big, n := -1, -1
 			for i, f := range res.Files {
-				if l := len(f.Text) + len(f.Base64); l >= n {
+				if l := len(f.Text) + len(f.Base64); f.OCI == "" && l >= n {
 					big, n = i, l
 				}
 			}
@@ -541,6 +596,17 @@ func fit(res *AgentResult) {
 			c.Stdout, c.Stderr, c.Command, c.Truncated = clip(c.Stdout, 64), clip(c.Stderr, 64), clip(c.Command, 64), true
 		}
 	}
+}
+
+// inlineFiles counts the kept files whose bytes are in the record.
+func inlineFiles(res *AgentResult) int {
+	n := 0
+	for _, f := range res.Files {
+		if f.OCI == "" {
+			n++
+		}
+	}
+	return n
 }
 
 // client builds the SDK client the way Ask does: one request per call, no
