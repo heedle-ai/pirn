@@ -60,7 +60,7 @@ func fakeOras(t *testing.T, fail bool) (string, string) {
 	dir := t.TempDir()
 	log := filepath.Join(dir, "log")
 	sh := `case "$1" in resolve|blob) exit 1;; esac
-printf '%s\n' "$*" >> ` + log + `; wc -c < content >> ` + log + `
+printf '%s\n' "$*" >> ` + log + `; wc -c < content | tr -d " " >> ` + log + `
 `
 	if fail {
 		sh += `echo 'Error: unauthorized: authentication required' >&2; exit 1`
