@@ -2,10 +2,13 @@ package pirn
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -82,6 +85,11 @@ type File struct {
 	Size   int    `json:"size"`
 	Text   string `json:"text,omitempty"`   // its contents, if valid UTF-8
 	Base64 string `json:"base64,omitempty"` // otherwise, base64
+	// A file too big for the record is kept in a registry instead (see
+	// Registry): OCI names the repository and SHA256 the file's digest,
+	// and neither Text nor Base64 is set. FetchCommand gets it back.
+	OCI    string `json:"oci,omitempty"`
+	SHA256 string `json:"sha256,omitempty"`
 }
 
 // AgentResult is an agent step's output: an Answer (its final reply, so
@@ -111,6 +119,9 @@ type Agent struct {
 	OnProgress func(AgentResult)
 	// CommandTimeout overrides the package's CommandTimeout when set.
 	CommandTimeout time.Duration
+	// Registry, if set, keeps files in /work/out too big for the record;
+	// without it they are listed as skipped.
+	Registry *Registry
 }
 
 func (a Agent) beat(res *AgentResult) {
@@ -135,6 +146,11 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 	}
 	if a.Image == "" {
 		return AgentResult{}, fmt.Errorf("%w: the worker has no agent image; give it one with -agent-image", ErrSetup)
+	}
+	if a.Registry != nil {
+		if err := a.Registry.check(); err != nil {
+			return AgentResult{}, err
+		}
 	}
 	if strings.TrimSpace(q.Instruction) == "" || len(q.Instruction) > MaxInstruction {
 		return AgentResult{}, fmt.Errorf("%w: an agent needs an instruction of at most %d bytes", ErrInvalid, MaxInstruction)
@@ -225,6 +241,10 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 	}
 	if strings.TrimSpace(res.Text) == "" {
 		res.Text = "(Claude ended without a reply.)"
+	}
+	// Nothing the agent started may change /work/out while it's collected.
+	if err := s.Stop(ctx); err != nil {
+		return res, err
 	}
 	if err := a.collect(ctx, s, &res); err != nil {
 		return res, err
@@ -348,7 +368,7 @@ func (a Agent) collect(ctx context.Context, s *bobbin.Session, res *AgentResult)
 		skip(res, "some files: too many names to list")
 	}
 	sort.Strings(paths)
-	total := 0
+	total, large := 0, int64(0)
 	for _, p := range paths {
 		rel := strings.TrimPrefix(p, "./")
 		if rel == "" {
@@ -363,7 +383,13 @@ func (a Agent) collect(ctx context.Context, s *bobbin.Session, res *AgentResult)
 			return ctx.Err()
 		}
 		if errors.Is(err, bobbin.ErrOutputTooLarge) {
-			skip(res, rel+": larger than 256 KiB")
+			if a.Registry == nil {
+				skip(res, rel+": larger than 256 KiB")
+				continue
+			}
+			if err := a.keepLarge(ctx, s, rel, res, &large); err != nil {
+				return err
+			}
 			continue
 		}
 		if err != nil {
@@ -378,7 +404,13 @@ func (a Agent) collect(ctx context.Context, s *bobbin.Session, res *AgentResult)
 		}
 		enc, _ := json.Marshal(f)
 		if total+len(enc) > MaxOutBytes {
-			skip(res, rel+": past the 512 KiB kept in all")
+			if a.Registry == nil {
+				skip(res, rel+": past the 512 KiB kept in all")
+				continue
+			}
+			if err := a.keepLarge(ctx, s, rel, res, &large); err != nil {
+				return err
+			}
 			continue
 		}
 		total += len(enc)
@@ -394,6 +426,75 @@ func (a Agent) collect(ctx context.Context, s *bobbin.Session, res *AgentResult)
 	}
 	res.Changes = changes
 	return nil
+}
+
+// keepLarge copies one file out of the session and keeps it in the
+// registry, adding it to res.Files with its digest; a file past
+// MaxLargeFile or the step's MaxLargeBytes, or one the registry refuses,
+// is listed as skipped. Only a cancelled step is an error. It heartbeats
+// while copying and pushing, which can take minutes.
+func (a Agent) keepLarge(ctx context.Context, s *bobbin.Session, rel string, res *AgentResult, used *int64) error {
+	path, f, done, err := tempContent()
+	if err != nil {
+		skip(res, rel+": no room on the worker: "+err.Error())
+		return nil
+	}
+	defer done()
+	stop := a.beatEvery(res, 20*time.Second)
+	defer stop()
+	h := sha256.New()
+	limit := min(int64(MaxLargeFile), MaxLargeBytes-*used)
+	n, err := s.ReadTo(ctx, OutDir+"/"+rel, io.MultiWriter(f, h), limit)
+	if cerr := f.Close(); err == nil && cerr != nil {
+		err = cerr
+	}
+	switch {
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case errors.Is(err, bobbin.ErrOutputTooLarge) && limit < MaxLargeFile:
+		skip(res, rel+": past the 16 GiB kept in a registry in all")
+		return nil
+	case errors.Is(err, bobbin.ErrOutputTooLarge):
+		skip(res, rel+": larger than 4 GiB")
+		return nil
+	case err != nil:
+		skip(res, rel+": couldn't be read")
+		return nil
+	}
+	sum := hex.EncodeToString(h.Sum(nil))
+	if err := a.Registry.push(ctx, path, sum); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		skip(res, rel+": the registry refused it: "+err.Error())
+		return nil
+	}
+	*used += n
+	res.Files = append(res.Files, File{Path: rel, Size: int(n), OCI: a.Registry.Repo, SHA256: sum})
+	return nil
+}
+
+// beatEvery heartbeats every d until the returned stop is called.
+func (a Agent) beatEvery(res *AgentResult, d time.Duration) (stop func()) {
+	if a.OnProgress == nil {
+		return func() {}
+	}
+	snap := *res // OnProgress gets a copy; collect keeps changing res
+	quit, finished := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(finished)
+		t := time.NewTicker(d)
+		defer t.Stop()
+		for {
+			select {
+			case <-quit:
+				return
+			case <-t.C:
+				a.OnProgress(snap)
+			}
+		}
+	}()
+	return func() { close(quit); <-finished }
 }
 
 // skip names a file not kept, up to MaxSkipped; past that it counts them.
