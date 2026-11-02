@@ -60,6 +60,10 @@ type Source struct {
 type Question struct {
 	Instruction string
 	Sources     []Source
+	// Skill, for an agent step, is a skill's folder: its files by path,
+	// SKILL.md among them, put in SkillDir before Claude starts. See
+	// CheckSkill for what it may hold.
+	Skill map[string][]byte
 }
 
 // Answer is what Claude said, and enough to know how it was produced. It is
@@ -106,11 +110,11 @@ func Prompt(q Question) (string, error) {
 	return b.String(), nil
 }
 
-var promptTag = regexp.MustCompile(`(?i)<(/?)(source|instruction)\b`)
+var promptTag = regexp.MustCompile(`(?i)<(/?)(source|instruction|skill)\b`)
 
-// inert stops text from forging the prompt's own structure: a <source> or
-// <instruction> tag inside it, opening or closing, in any case, has its
-// "<" written as "&lt;".
+// inert stops text from forging the prompt's own structure: a <source>,
+// <instruction> or <skill> tag inside it, opening or closing, in any case,
+// has its "<" written as "&lt;".
 func inert(text string) string {
 	return promptTag.ReplaceAllString(text, "&lt;$1$2")
 }

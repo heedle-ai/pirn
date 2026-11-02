@@ -113,27 +113,38 @@ func AgentCommand(a Agent) weft.Arrow[plan.Input, string] {
 		if len(in.Args) != 1 {
 			return "", temporal.NewNonRetryableApplicationError("agent needs exactly one instruction", "InvalidInput", nil)
 		}
-		if activity.IsActivity(ctx) {
-			a.OnProgress = func(r AgentResult) { activity.RecordHeartbeat(ctx, len(r.Commands)) }
-		}
-		q := Question{Instruction: in.Args[0], Sources: sources(in.Upstream, pageSource)}
-		res, err := a.Run(ctx, q)
-		var wait *RetryAfter
-		switch {
-		case ctx.Err() != nil && err != nil:
-			return "", err
-		case errors.Is(err, ErrInvalid):
-			return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
-		case errors.Is(err, ErrSetup):
-			return "", temporal.NewNonRetryableApplicationError(err.Error(), "AgentSetup", nil)
-		case errors.As(err, &wait):
-			return "", temporal.NewApplicationErrorWithOptions(err.Error(), "RateLimited", temporal.ApplicationErrorOptions{NextRetryDelay: wait.Delay})
-		case err != nil:
-			return "", err // retryable, in a fresh session
-		}
-		b, err := json.Marshal(res)
-		return string(b), err
+		return Step(ctx, a, Question{Instruction: in.Args[0], Sources: sources(in.Upstream, pageSource)})
 	}
+}
+
+// Sources are a step's upstream outputs as an agent's inputs, in node
+// order: a browse step's page as its URL, title and text.
+func Sources(upstream map[string]string) []Source { return sources(upstream, pageSource) }
+
+// Step runs one agent step on a, heartbeating to Temporal after every
+// command when ctx is an activity's, and returns the AgentResult as JSON.
+// Errors are classified for Temporal as AgentCommand's are. Other agent
+// steps, such as a skill's, run through it too.
+func Step(ctx context.Context, a Agent, q Question) (string, error) {
+	if activity.IsActivity(ctx) {
+		a.OnProgress = func(r AgentResult) { activity.RecordHeartbeat(ctx, len(r.Commands)) }
+	}
+	res, err := a.Run(ctx, q)
+	var wait *RetryAfter
+	switch {
+	case ctx.Err() != nil && err != nil:
+		return "", err
+	case errors.Is(err, ErrInvalid):
+		return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
+	case errors.Is(err, ErrSetup):
+		return "", temporal.NewNonRetryableApplicationError(err.Error(), "AgentSetup", nil)
+	case errors.As(err, &wait):
+		return "", temporal.NewApplicationErrorWithOptions(err.Error(), "RateLimited", temporal.ApplicationErrorOptions{NextRetryDelay: wait.Delay})
+	case err != nil:
+		return "", err // retryable, in a fresh session
+	}
+	b, err := json.Marshal(res)
+	return string(b), err
 }
 
 // AgentBuiltinSpec is the draft builtin: exactly one string, the

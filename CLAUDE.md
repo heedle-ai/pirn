@@ -69,6 +69,8 @@ why the existing tool can't do it.
   cancellation. A `Retry-After` from the API becomes Temporal's next retry
   delay.
 - Source text can't forge the prompt's tags (`inert`).
+- A skill is files in `/work/skill` plus its `SKILL.md` in the first message;
+  pirn runs skills but doesn't keep them (treadle does).
 - Agent steps run every command in a bobbin `Session` (never anything else),
   record every command, and are bounded (`MaxTurns`, `MaxCommands`,
   `CommandTimeout`, `ClaudeOutput`, `RecordedOutput`, `MaxOut*`,

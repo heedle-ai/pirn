@@ -86,3 +86,4 @@ jobs:
           grep -q -- '--- PASS: TestContainer_AgentInARealSession' containers.log
           grep -q -- '--- PASS: TestContainer_AgentKeepsAwkwardFiles' containers.log
           grep -q -- '--- PASS: TestContainer_AgentKeepsLargeFilesInARegistry' containers.log
+          grep -q -- '--- PASS: TestContainer_AgentFollowsASkill' containers.log
