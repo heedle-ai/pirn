@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="520" viewBox="0 0 680 520" role="img"><title>An ask step in pirn</title><desc>Upstream outputs, side by side, become sources: a reed page becomes its URL, title and text, without its screenshot; an earlier answer becomes its text; anything else is used as it is. The sources, then the instruction, make the prompt. pirn sends it to Claude once through Anthropic's Go SDK, signed with the worker's key, with retries left to Temporal. The answer, with the model, stop reason and token counts, is the step's output and is recorded in Git. The key is never recorded.</desc><style>
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+.w{stroke:#5F5E5A;stroke-width:1.5;fill:none}
+.d{stroke:#888780;stroke-width:0.8;fill:none;stroke-dasharray:5 4}
+.l{font-size:12px;fill:#5F5E5A}.f{font-size:13px;fill:#444441}
+.t1{font-size:14px;font-weight:600}.t2{font-size:12px}
+.p rect{fill:#EEEDFE;stroke:#534AB7}.p .t1{fill:#3C3489}.p .t2{fill:#534AB7}
+.g rect{fill:#E1F5EE;stroke:#0F6E56}.g .t1{fill:#085041}.g .t2{fill:#0F6E56}
+.c rect{fill:#FAECE7;stroke:#993C1D}.c .t1{fill:#712B13}.c .t2{fill:#993C1D}
+.n rect{fill:#F1EFE8;stroke:#5F5E5A}.n .t1{fill:#444441}.n .t2{fill:#5F5E5A}
+@media (prefers-color-scheme:dark){
+.w{stroke:#B4B2A9}.d{stroke:#888780}.l{fill:#B4B2A9}.f{fill:#D3D1C7}
+.p rect{fill:#3C3489;stroke:#AFA9EC}.p .t1{fill:#EEEDFE}.p .t2{fill:#CECBF6}
+.g rect{fill:#085041;stroke:#5DCAA5}.g .t1{fill:#E1F5EE}.g .t2{fill:#9FE1CB}
+.c rect{fill:#712B13;stroke:#F0997B}.c .t1{fill:#FAECE7}.c .t2{fill:#F5C4B3}
+.n rect{fill:#444441;stroke:#B4B2A9}.n .t1{fill:#F1EFE8}.n .t2{fill:#D3D1C7}}
+</style>
+<text class="f" x="40" y="34">(pipe (par (browse "https://a.example/") (echo "notes")) (ask "Summarize."))</text>
+<g class="n"><rect x="80" y="56" width="200" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="180" y="72" text-anchor="middle" dominant-baseline="central">n0: reed page</text><text class="t2" x="180" y="91" text-anchor="middle" dominant-baseline="central">URL, title, text, screenshot</text></g>
+<text class="l" x="340" y="84" text-anchor="middle">⊗</text>
+<g class="n"><rect x="400" y="56" width="200" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="500" y="72" text-anchor="middle" dominant-baseline="central">n1: any output</text><text class="t2" x="500" y="91" text-anchor="middle" dominant-baseline="central">text, or an earlier answer</text></g>
+<path class="w" d="M180 104 L180 140 L340 140 L340 160"/><path class="w" d="M500 104 L500 140 L340 140"/>
+<g class="p"><rect x="160" y="160" width="360" height="56" rx="6" stroke-width="0.8"/><text class="t1" x="340" y="178" text-anchor="middle" dominant-baseline="central">sources, in node ID order</text><text class="t2" x="340" y="200" text-anchor="middle" dominant-baseline="central">a page is its URL, title and text; never its screenshot</text></g>
+<text class="l" x="352" y="236">;</text><path class="w" d="M340 216 L340 252"/>
+<g class="p"><rect x="160" y="252" width="360" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="340" y="268" text-anchor="middle" dominant-baseline="central">prompt</text><text class="t2" x="340" y="287" text-anchor="middle" dominant-baseline="central">&lt;source&gt; … then &lt;instruction&gt;</text></g>
+<text class="l" x="352" y="320">;</text><path class="w" d="M340 300 L340 336"/>
+<g class="c"><rect x="160" y="336" width="360" height="56" rx="6" stroke-width="0.8"/><text class="t1" x="340" y="354" text-anchor="middle" dominant-baseline="central">Claude, once</text><text class="t2" x="340" y="376" text-anchor="middle" dominant-baseline="central">Anthropic's Go SDK · the worker's key · Temporal retries</text></g>
+<text class="l" x="352" y="412">;</text><path class="w" d="M340 392 L340 428"/>
+<g class="g"><rect x="160" y="428" width="360" height="56" rx="6" stroke-width="0.8"/><text class="t1" x="340" y="446" text-anchor="middle" dominant-baseline="central">answer: the step's output, in Git</text><text class="t2" x="340" y="468" text-anchor="middle" dominant-baseline="central">text · model · stop reason · tokens; never the key</text></g>
+</svg>
