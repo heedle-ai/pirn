@@ -64,6 +64,9 @@ type Question struct {
 	// SKILL.md among them, put in SkillDir before Claude starts. See
 	// CheckSkill for what it may hold.
 	Skill map[string][]byte
+	// Grant, for an agent step, is the connectors and tools it asks for;
+	// the worker's connectors must cover it (see Connectors).
+	Grant Grant
 }
 
 // Answer is what Claude said, and enough to know how it was produced. It is

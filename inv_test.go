@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,9 +16,12 @@ import (
 // TestInv_OnlyTheSDKTalksToClaude: pirn's code imports an allowlist. The
 // Messages API is reached only through Anthropic's SDK, and pirn opens no
 // sockets of its own: no net or net/http, so only the SDK can make a
-// request. Only bobbin (Podman) runs an agent's commands. The one
-// exception is registry.go, which alone may run a process and touch files:
-// oras, on a temporary copy of a file too big for the record.
+// request. Only bobbin (Podman) runs an agent's commands. The exceptions
+// are registry.go, which alone may run a process and touch files (oras, on
+// a temporary copy of a file too big for the record); mcp.go, which alone
+// reaches MCP servers, through the official Go SDK (net/http only to give
+// that SDK a client that sends a remote server its token); and
+// connector.go, which reads tokens from the worker's environment.
 func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 	allowed := map[string]bool{
 		"context": true, "encoding/json": true, "errors": true, "fmt": true,
@@ -42,7 +46,12 @@ func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 		}
 		for _, im := range af.Imports {
 			p, _ := strconv.Unquote(im.Path.Value)
-			if !allowed[p] && !(f == "registry.go" && (p == "os" || p == "os/exec" || p == "path/filepath")) {
+			except := map[string][]string{
+				"registry.go":  {"os", "os/exec", "path/filepath"},
+				"mcp.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/http", "github.com/anthropics/anthropic-sdk-go/packages/param"},
+				"connector.go": {"os", "net/url"},
+			}
+			if !allowed[p] && !slices.Contains(except[f], p) {
 				bad = append(bad, f+": "+p)
 			}
 		}

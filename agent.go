@@ -117,6 +117,12 @@ type AgentResult struct {
 	Changes     []bobbin.Change   `json:"changes"`               // every path changed in the container
 	More        int               `json:"moreChanges,omitempty"`
 	Inputs      map[string]string `json:"inputs"` // node ID -> the file it was given as
+	// Grant is the connectors and tools the step could use, if any (as
+	// ParseGrant reads them); Tools is every call it made or queued, and
+	// Writes the writes it queued, for loom to run once after the run.
+	Grant  string     `json:"grant,omitempty"`
+	Tools  []ToolCall `json:"tools,omitempty"`
+	Writes []Write    `json:"writes,omitempty"`
 }
 
 // Agent runs agent steps: Claude, with a bash tool, in a fresh bobbin
@@ -135,6 +141,11 @@ type Agent struct {
 	Registry *Registry
 	// CollectTimeout overrides the package's CollectTimeout when set.
 	CollectTimeout time.Duration
+	// Connectors are the MCP servers steps may be granted.
+	Connectors Connectors
+	// MCPTransport, if set, is how pirn reaches remote MCP servers itself
+	// (to list their writes); nil is http.DefaultTransport.
+	MCPTransport MCPRoundTripper
 }
 
 func (a Agent) beat(res *AgentResult) {
@@ -173,6 +184,21 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 			return AgentResult{}, err
 		}
 	}
+	var grant Grant
+	if len(q.Grant) > 0 {
+		if err := a.Connectors.Check(); err != nil {
+			return AgentResult{}, fmt.Errorf("%w: %v", ErrSetup, err)
+		}
+		var err error
+		if grant, err = a.Connectors.grantFor(q.Grant); err != nil {
+			return AgentResult{}, err
+		}
+	}
+	tb, err := a.openTools(ctx, grant)
+	if err != nil {
+		return AgentResult{}, err
+	}
+	defer tb.close()
 	s, err := a.Runner.Start(ctx, bobbin.Spec{Image: a.Image})
 	if err != nil {
 		if errors.Is(err, bobbin.ErrInvalid) || errors.Is(err, bobbin.ErrSetup) {
@@ -183,7 +209,7 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 	defer s.Close()
 
 	res := AgentResult{Answer: Answer{Pirn: 1, Model: a.Claude.model()}, Agent: 1, Image: a.Image,
-		Inputs: map[string]string{}, Commands: []Ran{}, Files: []File{}, Changes: []bobbin.Change{}}
+		Inputs: map[string]string{}, Commands: []Ran{}, Files: []File{}, Changes: []bobbin.Change{}, Grant: grant.String()}
 	var listing strings.Builder
 	for _, src := range q.Sources {
 		name := "in/" + src.ID + ".txt"
@@ -220,20 +246,21 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 	}
 
 	client := a.Claude.client()
-	msgs := []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(prompt))}
+	msgs := []anthropic.BetaMessageParam{anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(prompt))}
 	for turn := 1; turn <= MaxTurns; turn++ {
 		res.Turns = turn
 		a.beat(&res)
-		msg, err := a.ask(ctx, client, msgs, &res)
+		msg, err := a.ask(ctx, client, tb, msgs, &res)
 		if err != nil {
 			return res, err
 		}
+		recordRemote(msg, &res)
 		res.Model, res.StopReason = string(msg.Model), string(msg.StopReason)
 		res.InputTokens += msg.Usage.InputTokens
 		res.OutputTokens += msg.Usage.OutputTokens
 		msgs = append(msgs, msg.ToParam())
 		var text strings.Builder
-		var uses []anthropic.ContentBlockUnion
+		var uses []anthropic.BetaContentBlockUnion
 		for _, b := range msg.Content {
 			switch b.Type {
 			case "text":
@@ -252,7 +279,7 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 			res.Text = fmt.Sprintf("Stopped after %d turns without a final reply.", MaxTurns)
 			break
 		}
-		var results []anthropic.ContentBlockParamUnion
+		var results []anthropic.BetaContentBlockParamUnion
 		for _, b := range uses {
 			var out string
 			isErr := true
@@ -261,15 +288,17 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 				out = "Not run: your reply was cut off at the output limit, so this command may be incomplete. Send it again in smaller pieces."
 			case len(res.Commands) >= MaxCommands:
 				out = fmt.Sprintf("Not run: this step's limit of %d commands is reached. Reply with your summary now.", MaxCommands)
+			case b.Name != "bash":
+				out, isErr = a.call(ctx, tb, b, &res)
 			default:
 				out, isErr = a.run(ctx, s, b, &res)
 			}
 			if out == "" {
 				out = "(no output)" // an empty text block would be refused
 			}
-			results = append(results, anthropic.NewToolResultBlock(b.ID, out, isErr))
+			results = append(results, anthropic.NewBetaToolResultBlock(b.ID, out, isErr))
 		}
-		msgs = append(msgs, anthropic.NewUserMessage(results...))
+		msgs = append(msgs, anthropic.NewBetaUserMessage(results...))
 	}
 	if strings.TrimSpace(res.Text) == "" {
 		res.Text = "(Claude ended without a reply.)"
@@ -297,17 +326,21 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 // ask sends one turn to Claude. When Claude is rate limited or overloaded
 // it waits and tries again, up to askTries, so the session's work isn't
 // lost; a longer wait than maxWait, or a refusal, is returned.
-func (a Agent) ask(ctx context.Context, client anthropic.Client, msgs []anthropic.MessageParam, res *AgentResult) (*anthropic.Message, error) {
-	tools := []anthropic.ToolUnionParam{{OfBashTool20250124: &anthropic.ToolBash20250124Param{}}}
+func (a Agent) ask(ctx context.Context, client anthropic.Client, tb *toolbox, msgs []anthropic.BetaMessageParam, res *AgentResult) (*anthropic.BetaMessage, error) {
+	params := anthropic.BetaMessageNewParams{
+		Model:     anthropic.Model(a.Claude.model()),
+		MaxTokens: MaxTokens,
+		System:    []anthropic.BetaTextBlockParam{{Text: AgentSystem}},
+		Messages:  msgs,
+		Tools:     append([]anthropic.BetaToolUnionParam{{OfBashTool20250124: &anthropic.BetaToolBash20250124Param{}}}, tb.tools...),
+	}
+	if len(tb.servers) > 0 {
+		params.MCPServers = tb.servers
+		params.Betas = []anthropic.AnthropicBeta{MCPBeta}
+	}
 	for try := 1; ; try++ {
 		cctx, cancel := context.WithTimeout(ctx, AskTimeout)
-		msg, err := client.Messages.New(cctx, anthropic.MessageNewParams{
-			Model:     anthropic.Model(a.Claude.model()),
-			MaxTokens: MaxTokens,
-			System:    []anthropic.TextBlockParam{{Text: AgentSystem}},
-			Messages:  msgs,
-			Tools:     tools,
-		})
+		msg, err := client.Beta.Messages.New(cctx, params)
 		cancel()
 		if err == nil {
 			return msg, nil
@@ -345,7 +378,7 @@ func describe(src Source) string {
 
 // run runs one tool call in the session and records it. Its result is
 // what Claude sees.
-func (a Agent) run(ctx context.Context, s *bobbin.Session, b anthropic.ContentBlockUnion, res *AgentResult) (string, bool) {
+func (a Agent) run(ctx context.Context, s *bobbin.Session, b anthropic.BetaContentBlockUnion, res *AgentResult) (string, bool) {
 	var in struct {
 		Command string `json:"command"`
 		Restart bool   `json:"restart"`

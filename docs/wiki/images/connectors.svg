@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="520" viewBox="0 0 680 520" role="img"><title>Connectors in an agent step</title><desc>A step's grant, side by side with the worker's, is narrowed to what both allow, never more. Then the step uses, side by side: remote reads through Anthropic's MCP connector; a local server's tools in its own container with no network; and writes, which it only queues. Then the step's output records every call and queued write. Then, after the run's steps, each queued write waits for approval if it needs it and runs once, with one attempt, never retried. Then the record keeps the outputs side by side with writes.json, what came of each write.</desc><style>
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+.w{stroke:#5F5E5A;stroke-width:1.5;fill:none}
+.d{stroke:#888780;stroke-width:0.8;fill:none;stroke-dasharray:5 4}
+.l{font-size:12px;fill:#5F5E5A}.f{font-size:13px;fill:#444441}
+.t1{font-size:14px;font-weight:600}.t2{font-size:12px}
+.p rect{fill:#EEEDFE;stroke:#534AB7}.p .t1{fill:#3C3489}.p .t2{fill:#534AB7}
+.g rect{fill:#E1F5EE;stroke:#0F6E56}.g .t1{fill:#085041}.g .t2{fill:#0F6E56}
+.c rect{fill:#FAECE7;stroke:#993C1D}.c .t1{fill:#712B13}.c .t2{fill:#993C1D}
+.n rect{fill:#F1EFE8;stroke:#5F5E5A}.n .t1{fill:#444441}.n .t2{fill:#5F5E5A}
+@media (prefers-color-scheme:dark){
+.w{stroke:#B4B2A9}.d{stroke:#888780}.l{fill:#B4B2A9}.f{fill:#D3D1C7}
+.p rect{fill:#3C3489;stroke:#AFA9EC}.p .t1{fill:#EEEDFE}.p .t2{fill:#CECBF6}
+.g rect{fill:#085041;stroke:#5DCAA5}.g .t1{fill:#E1F5EE}.g .t2{fill:#9FE1CB}
+.c rect{fill:#712B13;stroke:#F0997B}.c .t1{fill:#FAECE7}.c .t2{fill:#F5C4B3}
+.n rect{fill:#444441;stroke:#B4B2A9}.n .t1{fill:#F1EFE8}.n .t2{fill:#D3D1C7}}
+</style>
+<g class="p"><rect x="40" y="24" width="280" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="180.0" y="40" text-anchor="middle" dominant-baseline="central">the step's grant</text><text class="t2" x="180.0" y="59" text-anchor="middle" dominant-baseline="central">(agent … "linear/search" "mail")</text></g>
+<text class="l" x="340" y="48" text-anchor="middle" dominant-baseline="central">⊗</text>
+<g class="p"><rect x="360" y="24" width="280" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="500.0" y="40" text-anchor="middle" dominant-baseline="central">the worker's grant</text><text class="t2" x="500.0" y="59" text-anchor="middle" dominant-baseline="central">its connectors file</text></g>
+<path class="w" d="M180 72 L180 96 L500 96 L500 72 M340 96 L340 120"/>
+<g class="g"><rect x="200" y="120" width="280" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="340.0" y="136" text-anchor="middle" dominant-baseline="central">narrow</text><text class="t2" x="340.0" y="155" text-anchor="middle" dominant-baseline="central">what both allow, never more</text></g>
+<path class="w" d="M340 168 L340 192 M110 192 L570 192 M110 192 L110 216 M340 192 L340 216 M570 192 L570 216"/>
+<g class="c"><rect x="10" y="216" width="200" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="110.0" y="232" text-anchor="middle" dominant-baseline="central">remote reads</text><text class="t2" x="110.0" y="251" text-anchor="middle" dominant-baseline="central">Anthropic's MCP connector</text></g>
+<text class="l" x="225" y="240" text-anchor="middle" dominant-baseline="central">⊗</text>
+<g class="c"><rect x="240" y="216" width="200" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="340.0" y="232" text-anchor="middle" dominant-baseline="central">local tools</text><text class="t2" x="340.0" y="251" text-anchor="middle" dominant-baseline="central">own container, no network</text></g>
+<text class="l" x="455" y="240" text-anchor="middle" dominant-baseline="central">⊗</text>
+<g class="n"><rect x="470" y="216" width="200" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="570.0" y="232" text-anchor="middle" dominant-baseline="central">writes</text><text class="t2" x="570.0" y="251" text-anchor="middle" dominant-baseline="central">queued, never run in the step</text></g>
+<path class="w" d="M110 264 L110 288 M340 264 L340 288 M570 264 L570 288 M110 288 L570 288 M340 288 L340 312"/>
+<g class="c"><rect x="200" y="312" width="280" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="340.0" y="328" text-anchor="middle" dominant-baseline="central">the step's output</text><text class="t2" x="340.0" y="347" text-anchor="middle" dominant-baseline="central">every call and queued write recorded</text></g>
+<path class="w" d="M340 360 L340 384"/>
+<g class="g"><rect x="200" y="384" width="280" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="340.0" y="400" text-anchor="middle" dominant-baseline="central">after the run's steps: each write once</text><text class="t2" x="340.0" y="419" text-anchor="middle" dominant-baseline="central">approval first if needed; one attempt</text></g>
+<path class="w" d="M340 432 L340 456"/>
+<g class="n"><rect x="200" y="456" width="280" height="48" rx="6" stroke-width="0.8"/><text class="t1" x="340.0" y="472" text-anchor="middle" dominant-baseline="central">the record</text><text class="t2" x="340.0" y="491" text-anchor="middle" dominant-baseline="central">outputs ⊗ writes.json, what came of each</text></g>
+</svg>
