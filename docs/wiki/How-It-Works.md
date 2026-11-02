@@ -67,6 +67,36 @@ Each attempt is one request to the Messages API through Anthropic's Go SDK, with
 | Rate limited, overloaded or a server error (429, 5xx, 529) without a delay, or the network failed | The error | Yes, with Temporal's backoff |
 | The run was cancelled | The cancellation | No |
 
+## Agent steps
+
+`(agent "instruction")` is the step for work, not just answers. Claude gets the [bash tool](https://docs.claude.com/en/docs/agents-and-tools/tool-use/bash-tool) and runs commands in a fresh [bobbin session](https://github.com/heedle-ai/bobbin/wiki/How-It-Works): one container for this step alone, with no network, no capabilities and nothing mounted from the machine.
+
+```lisp
+(pipe (par (browse "https://news.ycombinator.com/") (browse "https://lobste.rs/"))
+      (agent "Make out/stories.csv with every story's title, site and points, sorted by points."))
+```
+
+1. The session starts from the worker's agent image (`-agent-image`, a content-pinned image ID with `/bin/sh`). Each upstream output is written to `/work/in/<node>.txt` (a page as its title, URL and text).
+2. Claude is told what's in `/work/in` and given the instruction. Each `bash` call runs in a new shell in `/work` (files persist; `cd` and variables don't). Its output, exit code and up to 64 KiB of output go back to Claude.
+3. When Claude replies without a command, or after 30 turns, the step collects the files in `/work/out` and lists everything that changed in the container (`podman diff`). Then the container is removed.
+
+The step's output is the result as JSON (`pirn.AgentResult`): Claude's reply, model and tokens like `ask`, plus every command with its exit code, time and output, the files from `/work/out`, the changes, and which input became which file. A later step that reads it (an `ask`, say) sees only the reply: the commands and files are in the record and on the step's page, not in the next prompt. Everything is bounded:
+
+| Limit | Value |
+|---|---|
+| Turns | 30 (`MaxTurns`), then `stopReason` is `max_turns`; commands asked for on the last turn aren't run, since Claude would never see their results |
+| Commands | 60 a step (`MaxCommands`); later ones are answered "Not run" |
+| One command | 2 minutes (`CommandTimeout`); a command past it is stopped with every other process in the session, so it can't change files later |
+| Output Claude sees | 8 KiB of each command's output (`ClaudeOutput`), so a noisy command can't fill its context; a silent command is "(no output)" |
+| Each command's output kept in the record | 4 KiB of standard output and of standard error, marked when cut |
+| Files kept from `/work/out` | 20 files, 256 KiB each, 512 KiB in all, any file name; the rest, and unreadable files, are listed as skipped (20 named, then a count) |
+| Changes listed | 500 |
+| The whole result | under 1 MiB (`MaxResult`), well inside Temporal's 2 MB payload limit: if escaping makes it larger, recorded output is cut further, then files are dropped |
+
+A reply cut off at the output limit (`max_tokens`) may hold a half-written command, so its commands aren't run and Claude is told why. A rate limit or overload mid-step is retried in place (three tries, waiting as long as `Retry-After` asks, up to a minute), so the session and the work in it are kept; after that the error goes to Temporal, which retries the step from the start.
+
+The session's disk, memory and CPU are bobbin's: the hardening flags limit memory and processes, and its writable layer is on the worker's disk, so give workers disk to spare.
+
 ## Laws
 
 `ask` is a `weft.Arrow`, registered the same way as reed's `browse` and bobbin's `container`, so it composes under `pipe` and `par` exactly as they do. Two law tests check it with a deterministic stand-in for Claude: weft's identity laws (`TestLaw_AskIsAWeftArrow`), and that the question is a function of the step's inputs alone (`TestLaw_PromptIsAFunctionOfInputs`). Claude's answers themselves can differ between runs, so the laws hold up to the answer, which is why every answer is recorded with what it was given.

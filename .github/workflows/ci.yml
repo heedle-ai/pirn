@@ -38,6 +38,13 @@ jobs:
           repository: heedle-ai/reed
           path: reed
           ssh-key: ${{ secrets.REED_DEPLOY_KEY }}
+      - name: private-bobbin
+        # read-only deploy key on heedle-ai/bobbin
+        uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/bobbin
+          path: bobbin
+          ssh-key: ${{ secrets.BOBBIN_DEPLOY_KEY }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: pirn/go.mod
@@ -54,3 +61,17 @@ jobs:
       - name: invariants
         working-directory: pirn
         run: bash .github/invariants.sh
+      # GitHub's Linux runners have Podman; macOS runners have no container
+      # engine. Here the agent runs in a real container, and skipping fails.
+      - name: containers
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: pirn
+        env:
+          PIRN_REQUIRE_PODMAN: "1"
+        run: |
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y busybox-static >/dev/null
+          go test -count=1 -v -run 'TestContainer_' . | tee containers.log
+          ! grep -q -- '--- SKIP' containers.log
+          grep -q -- '--- PASS: TestContainer_AgentInARealSession' containers.log
+          grep -q -- '--- PASS: TestContainer_AgentKeepsAwkwardFiles' containers.log

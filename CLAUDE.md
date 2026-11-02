@@ -69,6 +69,13 @@ why the existing tool can't do it.
   cancellation. A `Retry-After` from the API becomes Temporal's next retry
   delay.
 - Source text can't forge the prompt's tags (`inert`).
+- Agent steps run every command in a bobbin `Session` (never anything else),
+  record every command, and are bounded (`MaxTurns`, `MaxCommands`,
+  `CommandTimeout`, `ClaudeOutput`, `RecordedOutput`, `MaxOut*`,
+  `MaxSkipped`, `MaxChanges`, `MaxResult`). Rate limits mid-step are
+  retried in place so the session survives; anything else goes to Temporal. Container tests are
+  `TestContainer_*`; CI's `containers` step runs them with
+  `PIRN_REQUIRE_PODMAN=1`.
 - Tests use a stand-in Messages API (`httptest`), so they need no key.
   `TestLive_*` asks the real Claude when `ANTHROPIC_API_KEY` is set; it is not
   an invariant guard, because CI has no key.

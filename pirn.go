@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
 )
 
 const (
@@ -141,15 +140,7 @@ func (c Claude) Ask(ctx context.Context, q Question) (Answer, error) {
 	if err != nil {
 		return Answer{}, err
 	}
-	opts := []option.RequestOption{
-		option.WithoutEnvironmentDefaults(),
-		option.WithAPIKey(c.APIKey),
-		option.WithMaxRetries(0),
-	}
-	if c.BaseURL != "" {
-		opts = append(opts, option.WithBaseURL(c.BaseURL))
-	}
-	client := anthropic.NewClient(opts...)
+	client := c.client()
 	ctx, cancel := context.WithTimeout(ctx, AskTimeout)
 	defer cancel()
 	msg, err := client.Messages.New(ctx, anthropic.MessageNewParams{
