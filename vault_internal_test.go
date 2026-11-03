@@ -220,7 +220,8 @@ func TestInv_ConnectorsReloadEachStep(t *testing.T) {
 	if _, err := a.RunWrite(ctx, Write{ID: "w1", Connector: "mail", Tool: "send", Input: []byte(`{}`)}); err == nil || !strings.Contains(err.Error(), "connectors") {
 		t.Errorf("an unreadable file: %v", err)
 	}
-	if _, err := a.Run(ctx, Question{Instruction: "x"}); !errors.Is(err, ErrSetup) || !strings.Contains(err.Error(), "connectors") {
+	// Retryable, not a setup error: the file may be mid-save (review 27).
+	if _, err := a.Run(ctx, Question{Instruction: "x"}); err == nil || errors.Is(err, ErrSetup) || !strings.Contains(err.Error(), "connectors") {
 		t.Errorf("a step with an unreadable file: %v", err)
 	}
 	now = Connectors{{Name: "maps", URL: "https://maps.example/mcp"}}
@@ -230,5 +231,60 @@ func TestInv_ConnectorsReloadEachStep(t *testing.T) {
 	b, err := a.fresh()
 	if err != nil || len(b.Connectors) != 1 || b.Connectors[0].Name != "maps" || calls != 4 {
 		t.Errorf("fresh = %v, %v after %d reads", b.Connectors, err, calls)
+	}
+	// A connector added to the file counts at once: its write passes the
+	// worker's checks and goes on to its server (review 27).
+	now = append(now, Connector{Name: "mail", URL: "http://127.0.0.1:1/mcp", Writes: []string{"send"}})
+	if _, err := a.RunWrite(ctx, Write{ID: "w1", Connector: "mail", Tool: "send", Input: []byte(`{}`)}); err == nil || strings.Contains(err.Error(), "no write") {
+		t.Errorf("a connector added later: %v", err)
+	}
+}
+
+// TestInv_WorkersKeepTheLastGood: LastGood gives what its load last gave
+// when it fails, so a worker keeps its connectors while their file is
+// being saved and its key while the keychain is locked for a moment; with
+// nothing before, the failure is load's. (Review 27.)
+func TestInv_WorkersKeepTheLastGood(t *testing.T) {
+	v, fail := "first", true
+	f := LastGood(func() (string, error) {
+		if fail {
+			return "", errors.New("mid-save")
+		}
+		return v, nil
+	})
+	if _, err := f(); err == nil {
+		t.Error("nothing to fall back on, yet no error")
+	}
+	fail = false
+	if got, err := f(); got != "first" || err != nil {
+		t.Errorf("good = %q, %v", got, err)
+	}
+	fail, v = true, "second"
+	if got, err := f(); got != "first" || err != nil {
+		t.Errorf("a failure after a good read = %q, %v", got, err)
+	}
+	fail = false
+	if got, _ := f(); got != "second" {
+		t.Errorf("the next good read = %q", got)
+	}
+}
+
+// TestInv_AgentStepsReadTheKeyToo: an agent step gets its key from
+// KeyFrom (a keychain-only worker), past the key check; a key it can't
+// read now is retryable, not a setup error. (Review 27: reverting
+// Agent.Run's check went unnoticed.)
+func TestInv_AgentStepsReadTheKeyToo(t *testing.T) {
+	ctx := context.Background()
+	a := Agent{Claude: Claude{KeyFrom: func(context.Context) (string, error) { return "sk-from-keychain", nil }}}
+	if _, err := a.Run(ctx, Question{Instruction: "x"}); err == nil || strings.Contains(err.Error(), "API key") || !strings.Contains(err.Error(), "agent image") {
+		t.Errorf("a key from the keychain: %v", err)
+	}
+	a.Claude.KeyFrom = func(context.Context) (string, error) { return "", errors.New("locked") }
+	if _, err := a.Run(ctx, Question{Instruction: "x"}); err == nil || errors.Is(err, ErrSetup) {
+		t.Errorf("a key that can't be read now: %v", err)
+	}
+	a.Claude.KeyFrom = func(context.Context) (string, error) { return "", nil }
+	if _, err := a.Run(ctx, Question{Instruction: "x"}); !errors.Is(err, ErrSetup) {
+		t.Errorf("no key at all: %v", err)
 	}
 }

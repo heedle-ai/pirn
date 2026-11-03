@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -260,7 +261,9 @@ func secretFor(ctx context.Context, v Vault, connector, name string) (string, er
 	if v != nil {
 		s, ok, err := v.Lookup(ctx, name)
 		if err != nil {
-			return "", err
+			// Not ErrSetup: a keychain locked for a moment is worth
+			// retrying (review 27).
+			return "", fmt.Errorf("connector %q: can't read %s now: %v", connector, name, err)
 		}
 		if ok {
 			return s, nil
@@ -298,4 +301,30 @@ func NoEcho(ctx context.Context) (restore func(), err error) {
 // securityLine is the security -i command that stores value as name.
 func securityLine(name, value string) string {
 	return fmt.Sprintf("add-generic-password -U -s %s -a %s -l \"heedle %s\" -w \"%s\"\n", KeychainService, name, name, value)
+}
+
+// LastGood wraps load so that a failure gives what load last gave
+// successfully, if anything: a worker keeps its connectors while their
+// file is being saved, and its key while the keychain is locked for a
+// moment (review 27). The first failure, with nothing to fall back on,
+// is load's own error.
+func LastGood[T any](load func() (T, error)) func() (T, error) {
+	var (
+		mu   sync.Mutex
+		last T
+		have bool
+	)
+	return func() (T, error) {
+		v, err := load()
+		mu.Lock()
+		defer mu.Unlock()
+		if err == nil {
+			last, have = v, true
+			return v, nil
+		}
+		if have {
+			return last, nil
+		}
+		return v, err
+	}
 }

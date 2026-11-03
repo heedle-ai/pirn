@@ -138,7 +138,9 @@ func (c Claude) withKey(ctx context.Context) (Claude, error) {
 	if c.APIKey == "" && c.KeyFrom != nil {
 		k, err := c.KeyFrom(ctx)
 		if err != nil {
-			return c, fmt.Errorf("%w: the worker can't read its Anthropic API key: %v", ErrSetup, err)
+			// Not ErrSetup: a keychain locked for a moment, or busy, is
+			// worth retrying (review 27).
+			return c, fmt.Errorf("the worker can't read its Anthropic API key now: %v", err)
 		}
 		c.APIKey = k
 	}
