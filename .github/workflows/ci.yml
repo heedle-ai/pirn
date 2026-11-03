@@ -67,6 +67,26 @@ jobs:
       - name: invariants
         working-directory: pirn
         run: bash .github/invariants.sh
+      # The real keychain: a throwaway login keychain on macOS, GNOME
+      # Keyring in its own session bus on Linux.
+      - name: keychain
+        if: matrix.os != 'ubuntu-24.04-arm'
+        working-directory: pirn
+        env:
+          PIRN_KEYCHAIN_TEST: "1"
+        run: |
+          if [ "$(uname)" = Darwin ]; then
+            security create-keychain -p ci heedle-ci.keychain
+            security list-keychains -d user -s heedle-ci.keychain
+            security default-keychain -d user -s heedle-ci.keychain
+            security unlock-keychain -p ci heedle-ci.keychain
+            security set-keychain-settings heedle-ci.keychain
+            go test -run 'TestKeychain_Real|TestInv_Secrets' -v .
+          else
+            sudo apt-get update >/dev/null
+            sudo apt-get install -y libsecret-tools gnome-keyring dbus >/dev/null
+            dbus-run-session -- sh -c 'echo ci | gnome-keyring-daemon --unlock --components=secrets >/dev/null && go test -run "TestKeychain_Real|TestInv_Secrets" -v .'
+          fi
       # GitHub's Linux runners have Podman; macOS runners have no container
       # engine. Here the agent runs in a real container, and skipping fails.
       - name: containers

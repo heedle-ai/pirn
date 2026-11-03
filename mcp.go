@@ -126,7 +126,7 @@ func (a Agent) openTools(ctx context.Context, g Grant) (*toolbox, error) {
 		c, _ := a.Connectors.Find(name)
 		granted := g[name]
 		if c.URL != "" {
-			token, err := c.token()
+			token, err := c.token(ctx, a.Vault)
 			if err != nil {
 				return nil, err
 			}
@@ -169,7 +169,7 @@ func (a Agent) openTools(ctx context.Context, g Grant) (*toolbox, error) {
 			}
 			continue
 		}
-		secrets, err := c.secrets()
+		secrets, err := c.secrets(ctx, a.Vault)
 		if err != nil {
 			return nil, err
 		}
@@ -509,13 +509,13 @@ func (a Agent) runWrite(ctx context.Context, w Write) (WriteResult, error) {
 	}
 	var tr mcp.Transport
 	if c.URL != "" {
-		token, err := c.token()
+		token, err := c.token(ctx, a.Vault)
 		if err != nil {
 			return WriteResult{}, err
 		}
 		tr = &mcp.StreamableClientTransport{Endpoint: c.URL, HTTPClient: bearer(token, a.MCPTransport), MaxRetries: -1, DisableStandaloneSSE: true}
 	} else {
-		secrets, err := c.secrets()
+		secrets, err := c.secrets(ctx, a.Vault)
 		if err != nil {
 			return WriteResult{}, err
 		}

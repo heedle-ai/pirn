@@ -143,6 +143,9 @@ type Agent struct {
 	CollectTimeout time.Duration
 	// Connectors are the MCP servers steps may be granted.
 	Connectors Connectors
+	// Vault, if set, holds the connectors' secrets that the worker's
+	// environment doesn't (Keychain, on a personal install).
+	Vault Vault
 	// MCPTransport, if set, is how pirn reaches remote MCP servers itself
 	// (to list their writes); nil is http.DefaultTransport.
 	MCPTransport MCPRoundTripper
