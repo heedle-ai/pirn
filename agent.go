@@ -143,6 +143,10 @@ type Agent struct {
 	CollectTimeout time.Duration
 	// Connectors are the MCP servers steps may be granted.
 	Connectors Connectors
+	// LoadConnectors, if set, replaces Connectors at the start of every
+	// step and write: a worker reading its connectors file then, so a
+	// connector added or changed needs no restart.
+	LoadConnectors func() (Connectors, error)
 	// Vault, if set, holds the connectors' secrets that the worker's
 	// environment doesn't (Keychain, on a personal install).
 	Vault Vault
@@ -168,8 +172,12 @@ func (a Agent) commandTimeout() time.Duration {
 // and the inputs, run its commands until it's done or MaxTurns, collect
 // /work/out and what changed, and remove the session.
 func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
-	if a.Claude.APIKey == "" {
-		return AgentResult{}, fmt.Errorf("%w: the worker has no Anthropic API key; set ANTHROPIC_API_KEY where it runs", ErrSetup)
+	a, err := a.fresh()
+	if err != nil {
+		return AgentResult{}, err
+	}
+	if a.Claude, err = a.Claude.withKey(ctx); err != nil {
+		return AgentResult{}, err
 	}
 	if a.Image == "" {
 		return AgentResult{}, fmt.Errorf("%w: the worker has no agent image; give it one with -agent-image", ErrSetup)
@@ -192,7 +200,6 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 		if err := a.Connectors.Check(); err != nil {
 			return AgentResult{}, fmt.Errorf("%w: %v", ErrSetup, err)
 		}
-		var err error
 		if grant, err = a.Connectors.grantFor(q.Grant); err != nil {
 			return AgentResult{}, err
 		}
@@ -728,4 +735,17 @@ func clip(s string, n int) string {
 		n--
 	}
 	return s[:n]
+}
+
+// fresh is a with its connectors as LoadConnectors has them now.
+func (a Agent) fresh() (Agent, error) {
+	if a.LoadConnectors == nil {
+		return a, nil
+	}
+	cs, err := a.LoadConnectors()
+	if err != nil {
+		return a, fmt.Errorf("%w: the worker's connectors: %v", ErrSetup, err)
+	}
+	a.Connectors = cs
+	return a, nil
 }

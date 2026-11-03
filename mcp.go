@@ -494,6 +494,10 @@ func (a Agent) RunWrite(ctx context.Context, w Write) (WriteResult, error) {
 }
 
 func (a Agent) runWrite(ctx context.Context, w Write) (WriteResult, error) {
+	a, err := a.fresh()
+	if err != nil {
+		return WriteResult{}, err
+	}
 	if err := a.Connectors.Check(); err != nil {
 		return WriteResult{}, err
 	}
