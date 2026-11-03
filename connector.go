@@ -1,6 +1,7 @@
 package pirn
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -175,27 +176,28 @@ func (c Connector) IsWrite(tool string) bool {
 	return false
 }
 
-// token is a remote connector's token, from the worker's environment.
-func (c Connector) token() (string, error) {
+// getenv is os.Getenv; a variable so tests can stand in an environment.
+var getenv = os.Getenv
+
+// token is a remote connector's token, from the worker's environment or
+// its vault (secretFor).
+func (c Connector) token(ctx context.Context, v Vault) (string, error) {
 	if c.TokenEnv == "" {
 		return "", nil
 	}
-	v := os.Getenv(c.TokenEnv)
-	if v == "" {
-		return "", fmt.Errorf("%w: connector %q needs %s set where the worker runs", ErrSetup, c.Name, c.TokenEnv)
-	}
-	return v, nil
+	return secretFor(ctx, v, c.Name, c.TokenEnv)
 }
 
-// secrets are a local connector's secrets, from the worker's environment.
-func (c Connector) secrets() (map[string]string, error) {
+// secrets are a local connector's secrets, from the worker's environment
+// or its vault (secretFor).
+func (c Connector) secrets(ctx context.Context, v Vault) (map[string]string, error) {
 	out := map[string]string{}
 	for k, from := range c.Secrets {
-		v := os.Getenv(from)
-		if v == "" {
-			return nil, fmt.Errorf("%w: connector %q needs %s set where the worker runs", ErrSetup, c.Name, from)
+		s, err := secretFor(ctx, v, c.Name, from)
+		if err != nil {
+			return nil, err
 		}
-		out[k] = v
+		out[k] = s
 	}
 	return out, nil
 }
