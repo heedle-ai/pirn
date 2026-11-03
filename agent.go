@@ -744,7 +744,8 @@ func (a Agent) fresh() (Agent, error) {
 	}
 	cs, err := a.LoadConnectors()
 	if err != nil {
-		return a, fmt.Errorf("%w: the worker's connectors: %v", ErrSetup, err)
+		// Not ErrSetup: a file being saved is worth retrying (review 27).
+		return a, fmt.Errorf("the worker's connectors: %v", err)
 	}
 	a.Connectors = cs
 	return a, nil

@@ -345,8 +345,8 @@ func TestLive_Ask(t *testing.T) {
 
 // TestInv_KeyReadEachRequest: a worker's Claude with KeyFrom reads its key
 // for every request, so a key stored while the worker runs is used at
-// once; a key it can't read, or an empty one, is a setup error and no
-// request. (Roadmap 7.2.)
+// once; no key is a setup error, a key it can't read now a retryable one,
+// and neither is a request. (Roadmap 7.2; review 27.)
 func TestInv_KeyReadEachRequest(t *testing.T) {
 	f := newFakeAPI(t, 200, okBody)
 	key, keyErr := "", error(nil)
@@ -363,8 +363,10 @@ func TestInv_KeyReadEachRequest(t *testing.T) {
 	if _, err := c.Ask(context.Background(), q); err != nil || f.last.Key != "sk-second" {
 		t.Fatalf("a key stored later: %v, sent %q", err, f.last.Key)
 	}
+	// A key that can't be read now is retryable (review 27); none is no
+	// request either way.
 	keyErr = errors.New("keychain locked")
-	if _, err := c.Ask(context.Background(), q); !errors.Is(err, pirn.ErrSetup) || f.calls.Load() != 2 {
+	if _, err := c.Ask(context.Background(), q); err == nil || errors.Is(err, pirn.ErrSetup) || f.calls.Load() != 2 {
 		t.Errorf("unreadable key: %v, %d requests", err, f.calls.Load())
 	}
 }
