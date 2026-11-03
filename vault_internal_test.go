@@ -65,7 +65,7 @@ func TestInv_SecretsStayOffCommandLines(t *testing.T) {
 	for _, sys := range []string{"darwin", "linux"} {
 		t.Run(sys, func(t *testing.T) {
 			goos = sys
-			t.Cleanup(func() { goos = "linux" })
+			t.Cleanup(func() { goos = runtime.GOOS })
 			dir := t.TempDir()
 			// Stand-ins for security and secret-tool: each logs its
 			// arguments and standard input, and keeps one secret in a file.
