@@ -201,3 +201,34 @@ func TestInv_KeychainNeverHangsOrOverflows(t *testing.T) {
 		t.Errorf("a keychain that doesn't answer: %v after %v", err, time.Since(start))
 	}
 }
+
+// TestInv_ConnectorsReloadEachStep: a worker given LoadConnectors reads
+// its connectors at the start of every step and write, so one added,
+// changed or removed counts from the next step with no restart; a file
+// it can't read fails the step as setup. (Roadmap 7.2.)
+func TestInv_ConnectorsReloadEachStep(t *testing.T) {
+	ctx := context.Background()
+	calls := 0
+	var now Connectors
+	a := Agent{LoadConnectors: func() (Connectors, error) {
+		calls++
+		if now == nil {
+			return nil, errors.New("connectors.json: unexpected end of JSON input")
+		}
+		return now, nil
+	}}
+	if _, err := a.RunWrite(ctx, Write{ID: "w1", Connector: "mail", Tool: "send", Input: []byte(`{}`)}); err == nil || !strings.Contains(err.Error(), "connectors") {
+		t.Errorf("an unreadable file: %v", err)
+	}
+	if _, err := a.Run(ctx, Question{Instruction: "x"}); !errors.Is(err, ErrSetup) || !strings.Contains(err.Error(), "connectors") {
+		t.Errorf("a step with an unreadable file: %v", err)
+	}
+	now = Connectors{{Name: "maps", URL: "https://maps.example/mcp"}}
+	if _, err := a.RunWrite(ctx, Write{ID: "w1", Connector: "mail", Tool: "send", Input: []byte(`{}`)}); err == nil || !strings.Contains(err.Error(), "no write mail/send") {
+		t.Errorf("a connector the file doesn't have: %v", err)
+	}
+	b, err := a.fresh()
+	if err != nil || len(b.Connectors) != 1 || b.Connectors[0].Name != "maps" || calls != 4 {
+		t.Errorf("fresh = %v, %v after %d reads", b.Connectors, err, calls)
+	}
+}

@@ -342,3 +342,29 @@ func TestLive_Ask(t *testing.T) {
 		t.Errorf("answer = %+v", a)
 	}
 }
+
+// TestInv_KeyReadEachRequest: a worker's Claude with KeyFrom reads its key
+// for every request, so a key stored while the worker runs is used at
+// once; a key it can't read, or an empty one, is a setup error and no
+// request. (Roadmap 7.2.)
+func TestInv_KeyReadEachRequest(t *testing.T) {
+	f := newFakeAPI(t, 200, okBody)
+	key, keyErr := "", error(nil)
+	c := pirn.Claude{BaseURL: f.srv.URL, KeyFrom: func(context.Context) (string, error) { return key, keyErr }}
+	q := pirn.Question{Instruction: "Say hello."}
+	if _, err := c.Ask(context.Background(), q); !errors.Is(err, pirn.ErrSetup) || f.calls.Load() != 0 {
+		t.Fatalf("no key yet: %v, %d requests", err, f.calls.Load())
+	}
+	key = "sk-first"
+	if _, err := c.Ask(context.Background(), q); err != nil || f.last.Key != "sk-first" {
+		t.Fatalf("first key: %v, sent %q", err, f.last.Key)
+	}
+	key = "sk-second"
+	if _, err := c.Ask(context.Background(), q); err != nil || f.last.Key != "sk-second" {
+		t.Fatalf("a key stored later: %v, sent %q", err, f.last.Key)
+	}
+	keyErr = errors.New("keychain locked")
+	if _, err := c.Ask(context.Background(), q); !errors.Is(err, pirn.ErrSetup) || f.calls.Load() != 2 {
+		t.Errorf("unreadable key: %v, %d requests", err, f.calls.Load())
+	}
+}

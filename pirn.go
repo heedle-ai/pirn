@@ -124,9 +124,28 @@ func inert(text string) string {
 
 // Claude asks Claude through the Messages API.
 type Claude struct {
-	APIKey  string // required; never recorded
+	APIKey string // required, unless KeyFrom gives it; never recorded
+	// KeyFrom, if set and APIKey is empty, gives the key for each request:
+	// a worker reading it from its environment or keychain then, so a key
+	// stored while it runs needs no restart.
+	KeyFrom func(context.Context) (string, error)
 	Model   string // DefaultModel if empty
 	BaseURL string // the API's own if empty; set by tests
+}
+
+// withKey is c with its key, from KeyFrom if APIKey is empty.
+func (c Claude) withKey(ctx context.Context) (Claude, error) {
+	if c.APIKey == "" && c.KeyFrom != nil {
+		k, err := c.KeyFrom(ctx)
+		if err != nil {
+			return c, fmt.Errorf("%w: the worker can't read its Anthropic API key: %v", ErrSetup, err)
+		}
+		c.APIKey = k
+	}
+	if c.APIKey == "" {
+		return c, fmt.Errorf("%w: the worker has no Anthropic API key: run `heedle secret set ANTHROPIC_API_KEY`, or set ANTHROPIC_API_KEY where it runs", ErrSetup)
+	}
+	return c, nil
 }
 
 func (c Claude) model() string {
@@ -140,8 +159,9 @@ func (c Claude) model() string {
 // attempt. The SDK's environment defaults (ANTHROPIC_* variables, profiles)
 // are off, so only c decides where the request goes and how it's signed.
 func (c Claude) Ask(ctx context.Context, q Question) (Answer, error) {
-	if c.APIKey == "" {
-		return Answer{}, fmt.Errorf("%w: the worker has no Anthropic API key; set ANTHROPIC_API_KEY where it runs", ErrSetup)
+	c, err := c.withKey(ctx)
+	if err != nil {
+		return Answer{}, err
 	}
 	prompt, err := Prompt(q)
 	if err != nil {
