@@ -5,8 +5,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeVault map[string]string
@@ -72,8 +74,10 @@ echo "ARGS $*" >> "$LOG"
 case "$1" in
   -i) cat >> "$LOG"; cat "$LOG" | grep -o 'w "[^"]*"' | tail -1 | sed 's/w "//; s/"$//' | tr -d '\n' > "$STORE";;
   store) cat > "$STORE"; cat "$STORE" >> "$LOG";;
-  find-generic-password|lookup) [ -s "$STORE" ] || exit $MISSING; cat "$STORE"; echo;;
-  delete-generic-password|clear) [ -s "$STORE" ] || exit $MISSING; rm "$STORE";;
+  find-generic-password|lookup) [ -n "$LOCKED" ] && exit 1; [ -s "$STORE" ] || exit $MISSING; cat "$STORE"; echo;;
+  search) if [ -s "$STORE" ]; then echo "[/1] label = heedle"; fi;;
+  delete-generic-password|clear) [ -n "$LOCKED" ] && exit 0; [ -s "$STORE" ] || exit $MISSING; rm "$STORE";;
+  hang) sleep 5;;
 esac
 `
 			name, missing := "secret-tool", "1"
@@ -125,6 +129,20 @@ esac
 			if b, _ := os.ReadFile(filepath.Join(dir, "log")); len(b) > 0 {
 				t.Errorf("a refused secret ran a command: %s", b)
 			}
+			if sys == "linux" {
+				// A locked keyring: secret-tool says nothing for a lookup and
+				// "clears" without clearing (review 26).
+				if err := k.Store(ctx, "MAPS_KEY", value); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv("LOCKED", "1")
+				if _, ok, err := k.Lookup(ctx, "MAPS_KEY"); ok || !errors.Is(err, ErrSetup) || !strings.Contains(err.Error(), "locked") {
+					t.Errorf("a locked keyring read as %v, %v", ok, err)
+				}
+				if err := k.Delete(ctx, "MAPS_KEY"); err == nil {
+					t.Error("a delete a locked keyring ignored said it worked")
+				}
+			}
 		})
 	}
 }
@@ -159,5 +177,27 @@ func TestKeychain_Real(t *testing.T) {
 	}
 	if err := k.Delete(ctx, name); err != nil {
 		t.Fatalf("deleting what isn't there: %v", err)
+	}
+}
+
+// TestInv_KeychainNeverHangsOrOverflows: a keychain command that doesn't
+// answer (a permission window nobody sees) is an error after
+// KeychainTimeout; and the longest name and value make a macOS command
+// line security -i reads whole (it reads 4096 bytes a line and runs the
+// rest as another command). (Review 26.)
+func TestInv_KeychainNeverHangsOrOverflows(t *testing.T) {
+	line := securityLine(strings.Repeat("N", MaxSecretName), strings.Repeat("v", MaxSecret))
+	if len(line) >= 4096 || CheckSecret(strings.Repeat("N", MaxSecretName+1), "v") == nil {
+		t.Errorf("the longest command is %d bytes", len(line))
+	}
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "secret-tool"), []byte("#!/bin/sh\nsleep 5\n"), 0o755)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	goos, KeychainTimeout = "linux", 200*time.Millisecond
+	t.Cleanup(func() { goos, KeychainTimeout = runtime.GOOS, 15*time.Second })
+	start := time.Now()
+	_, _, err := Keychain{}.Lookup(context.Background(), "MAPS_KEY")
+	if !errors.Is(err, ErrSetup) || !strings.Contains(err.Error(), "didn't answer") || time.Since(start) > 3*time.Second {
+		t.Errorf("a keychain that doesn't answer: %v after %v", err, time.Since(start))
 	}
 }
