@@ -73,6 +73,7 @@ jobs:
         working-directory: pirn
         env:
           PIRN_KEYCHAIN_TEST: "1"
+          PIRN_KEYCHAIN_TEST_DELETE_ALL: "1"
         run: |
           if [ "$(uname)" = Darwin ]; then
             security create-keychain -p ci heedle-ci.keychain

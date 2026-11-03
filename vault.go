@@ -149,6 +149,49 @@ func (k Keychain) Delete(ctx context.Context, name string) error {
 	return nil
 }
 
+// MaxDeleteAll bounds how many items DeleteAll removes on macOS, where
+// security deletes one a call.
+const MaxDeleteAll = 10000
+
+// DeleteAll removes every secret heedle keeps: every item filed under
+// KeychainService, and nothing else. It returns how many it removed, or
+// -1 on Linux, where secret-tool removes them in one call without
+// counting. Afterwards none is left, or it's an error (a locked keychain
+// keeps its items).
+func (Keychain) DeleteAll(ctx context.Context) (int, error) {
+	switch goos {
+	case "darwin":
+		n := 0
+		for ; n < MaxDeleteAll; n++ {
+			_, errOut, err := run(ctx, exec.Command("security", "delete-generic-password", "-s", KeychainService), "")
+			var ee *exec.ExitError
+			if errors.As(err, &ee) && ee.ExitCode() == 44 {
+				return n, nil // none left
+			}
+			if err != nil {
+				return n, keychainError("delete", "every heedle key", err, errOut, "")
+			}
+		}
+		return n, fmt.Errorf("%w: keychain: stopped after deleting %d heedle keys", ErrSetup, n)
+	case "linux":
+		_, errOut, err := run(ctx, exec.Command("secret-tool", "clear", "service", KeychainService), "")
+		var ee *exec.ExitError
+		if err != nil && !(errors.As(err, &ee) && ee.ExitCode() == 1 && strings.TrimSpace(errOut) == "") {
+			return 0, keychainError("delete", "every heedle key", err, errOut, "")
+		}
+		// clear says nothing of a locked keyring: look again.
+		out, errOut, err := run(ctx, exec.Command("secret-tool", "search", "service", KeychainService), "")
+		if err != nil {
+			return 0, keychainError("delete", "every heedle key", err, errOut, "")
+		}
+		if strings.TrimSpace(out+errOut) != "" {
+			return 0, fmt.Errorf("%w: keychain: the keyring holding heedle's keys is locked: unlock it, and try again", ErrSetup)
+		}
+		return -1, nil
+	}
+	return 0, errNoKeychain()
+}
+
 // absent reports whether a command that failed with err failed because
 // name isn't there. macOS's security says so (exit 44); Linux's
 // secret-tool exits 1 saying nothing both for that and for a locked

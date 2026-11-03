@@ -178,6 +178,19 @@ func TestKeychain_Real(t *testing.T) {
 	if err := k.Delete(ctx, name); err != nil {
 		t.Fatalf("deleting what isn't there: %v", err)
 	}
+	// Every heedle key, only with a throwaway keychain (CI's).
+	if os.Getenv("PIRN_KEYCHAIN_TEST_DELETE_ALL") == "1" {
+		k.Store(ctx, name, "a1")
+		k.Store(ctx, name+"_2", "a2")
+		if n, err := k.DeleteAll(ctx); err != nil || (goos == "darwin" && n != 2) {
+			t.Fatalf("DeleteAll: %d %v", n, err)
+		}
+		for _, n := range []string{name, name + "_2"} {
+			if _, ok, err := k.Lookup(ctx, n); ok || err != nil {
+				t.Errorf("%s after DeleteAll: %v %v", n, ok, err)
+			}
+		}
+	}
 }
 
 // TestInv_KeychainNeverHangsOrOverflows: a keychain command that doesn't
@@ -286,5 +299,59 @@ func TestInv_AgentStepsReadTheKeyToo(t *testing.T) {
 	a.Claude.KeyFrom = func(context.Context) (string, error) { return "", nil }
 	if _, err := a.Run(ctx, Question{Instruction: "x"}); !errors.Is(err, ErrSetup) {
 		t.Errorf("no key at all: %v", err)
+	}
+}
+
+// TestInv_DeleteAllTakesOnlyHeedles: DeleteAll removes every item filed
+// under heedle's service and asks for nothing else: on macOS one at a
+// time until security says none is left (and counts them), on Linux in
+// one clear by the service, then looks again, so a locked keyring that
+// kept them is an error, never "done". (Roadmap 7.1.)
+func TestInv_DeleteAllTakesOnlyHeedles(t *testing.T) {
+	ctx := context.Background()
+	t.Cleanup(func() { goos = runtime.GOOS })
+	dir := t.TempDir()
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("LOG", filepath.Join(dir, "log"))
+	t.Setenv("LEFT", filepath.Join(dir, "left"))
+
+	goos = "darwin"
+	os.WriteFile(filepath.Join(dir, "security"), []byte(`#!/bin/sh
+echo "$*" >> "$LOG"
+n=$(cat "$LEFT"); [ "$n" -gt 0 ] || exit 44
+echo $((n-1)) > "$LEFT"
+`), 0o755)
+	os.WriteFile(filepath.Join(dir, "left"), []byte("3\n"), 0o644)
+	if n, err := (Keychain{}).DeleteAll(ctx); n != 3 || err != nil {
+		t.Errorf("macOS: %d %v", n, err)
+	}
+	log, _ := os.ReadFile(filepath.Join(dir, "log"))
+	for _, line := range strings.Split(strings.TrimSpace(string(log)), "\n") {
+		if line != "delete-generic-password -s heedle" {
+			t.Errorf("macOS asked: %q", line)
+		}
+	}
+
+	goos = "linux"
+	os.Remove(filepath.Join(dir, "log"))
+	os.WriteFile(filepath.Join(dir, "secret-tool"), []byte(`#!/bin/sh
+echo "$*" >> "$LOG"
+case "$1" in
+  clear) [ -n "$LOCKED" ] || : > "$LEFT";;
+  search) [ -s "$LEFT" ] && echo "[/1] label = heedle X";;
+esac
+exit 0
+`), 0o755)
+	os.WriteFile(filepath.Join(dir, "left"), []byte("2\n"), 0o644)
+	if n, err := (Keychain{}).DeleteAll(ctx); n != -1 || err != nil {
+		t.Errorf("Linux: %d %v", n, err)
+	}
+	if log, _ := os.ReadFile(filepath.Join(dir, "log")); string(log) != "clear service heedle\nsearch service heedle\n" {
+		t.Errorf("Linux asked: %q", log)
+	}
+	t.Setenv("LOCKED", "1")
+	os.WriteFile(filepath.Join(dir, "left"), []byte("2\n"), 0o644)
+	if _, err := (Keychain{}).DeleteAll(ctx); err == nil || !strings.Contains(err.Error(), "locked") {
+		t.Errorf("a locked keyring: %v", err)
 	}
 }
