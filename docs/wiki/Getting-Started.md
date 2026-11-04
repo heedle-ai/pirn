@@ -1,10 +1,8 @@
 ## 1. Clone and test
 
-pirn builds against sibling checkouts of the other heedle-ai repos. bobbin, reed and pirn are private, so let git use your GitHub CLI login:
+pirn builds against sibling checkouts of the other heedle-ai repos, all public:
 
 ```bash
-gh auth login        # once; bobbin, reed and pirn are private
-gh auth setup-git    # lets git clone them with your gh login
 mkdir -p ~/src/heedle-ai && cd ~/src/heedle-ai
 for r in weft draft shuttle bobbin reed pirn; do git clone https://github.com/heedle-ai/$r.git; done
 cd pirn
