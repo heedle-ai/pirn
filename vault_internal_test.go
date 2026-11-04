@@ -406,6 +406,12 @@ func TestInv_ReadyAgreesWithRuns(t *testing.T) {
 			t.Errorf("%s: Ready says %q, but a run would %s", c.grant, needs[0].Problem, map[bool]string{true: "start", false: "fail"}[runOK])
 		}
 	}
+	// Review 33: what a step could change, and whether it waits for you.
+	writer := Connectors{{Name: "mail", URL: "https://mail.example/mcp", Writes: []string{"send", "delete"}, Approve: true}, {Name: "slack", URL: "https://s.example/mcp", Writes: []string{"post"}}}
+	g, _ := ParseGrant([]string{"mail/send", "mail/read", "slack"})
+	if n := writer.Ready(ctx, g, v); n[0].Connector != "mail" || strings.Join(n[0].Writes, ",") != "send" || !n[0].Approve || strings.Join(n[1].Writes, ",") != "post" || n[1].Approve {
+		t.Errorf("writes: %+v", n)
+	}
 	if n := cs.Ready(ctx, Grant{}, v); len(n) != 0 {
 		t.Errorf("no grant, no needs: %+v", n)
 	}

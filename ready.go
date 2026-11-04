@@ -14,15 +14,19 @@ import (
 //   - "unreadable": a key couldn't be read now (Detail says why), such as a
 //     keychain that is locked or waiting for you to allow access.
 //
-// Ready decides it as a step that starts now would: the same grant
-// (grantFor) and the same places for keys (secretFor), so a proposal is
-// never called ready when its run would fail for want of a connector.
+// Ready decides it with the same grant (grantFor) and the same places
+// for keys (secretFor) as a step that starts now. Writes are the tools
+// of it the grant allows that change something outside the run, and
+// Approve whether they wait for a person: so a proposal can say, before
+// it runs, that it would send or change something.
 type Need struct {
 	Connector string   `json:"connector"`
 	Tools     []string `json:"tools,omitempty"` // the tools asked for, if not all
 	Problem   string   `json:"problem,omitempty"`
 	Key       string   `json:"key,omitempty"`
 	Detail    string   `json:"detail,omitempty"`
+	Writes    []string `json:"writes,omitempty"`
+	Approve   bool     `json:"approve,omitempty"`
 }
 
 // Ready is, for each connector asked names, whether cs (with keys from the
@@ -40,6 +44,15 @@ func (cs Connectors) Ready(ctx context.Context, asked Grant, v Vault) []Need {
 			sort.Strings(n.Tools)
 		}
 		c, ok := cs.Find(name)
+		if ok {
+			for _, w := range c.Writes {
+				if t.All || t.Names[w] {
+					n.Writes = append(n.Writes, w)
+				}
+			}
+			sort.Strings(n.Writes)
+			n.Approve = c.Approve && len(n.Writes) > 0
+		}
 		switch {
 		case !ok:
 			n.Problem = "absent"
