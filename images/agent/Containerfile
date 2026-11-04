@@ -12,6 +12,7 @@ RUN apt-get update \
  && useradd --uid 1000 --user-group --create-home --shell /bin/bash agent \
  && mkdir /work \
  && chown agent:agent /work
+LABEL org.opencontainers.image.source=https://github.com/heedle-ai/pirn
 USER agent
 ENV HOME=/home/agent
 WORKDIR /work

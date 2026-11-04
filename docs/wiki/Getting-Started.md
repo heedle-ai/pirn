@@ -67,9 +67,9 @@ It is Debian bookworm (`debian:bookworm-slim`, pinned by digest) with these pack
 | `jq` | reading and reshaping JSON, the format most inputs and APIs use |
 | `python3` | scripts for anything the shell tools can't do comfortably |
 
-It runs as `agent` (uid 1000), not root, in `/work`, which that user owns. Every package added needs a row in this table: `TestInv_AgentImageIsPinnedAndUnprivileged` fails otherwise.
+It runs as `agent` (uid 1000), not root, in `/work`, which that user owns. The packages are Debian's on the day the workflow runs, so two runs give different images; what heedle pins is the digest of the one that was tested and published. Every package added needs a row in this table: `TestInv_AgentImageIsPinnedAndUnprivileged` fails otherwise.
 
-The workflow runs from the Actions tab (**Image → Run workflow**) or on a tag `image-v*`. Each architecture is built on its own runner, checked for the tools above, the user and `/work`, and must pass the agent container tests in real sessions before it is saved; only then are both pushed by digest, under one manifest list. The run's summary names the manifest list's digest, which is what heedle pins. The tag pushed with it (the `image-v*` tag, or `run-<run ID>`) is only a label.
+The workflow runs on a tag `image-v*`, using the workflow in the commit the tag names, and, once it is on `main`, from the Actions tab (**Image → Run workflow**). Each architecture is built on its own runner, checked for the tools above, the user and `/work`, and must pass the agent container tests in real sessions before it is saved; only then are both pushed by digest, under one manifest list. The run's summary names the manifest list's digest, which is what heedle pins. The tag pushed with it (the `image-v*` tag, or `run-<run ID>`) is only a label.
 
 To run those tests against an image of your own, give its ID as `PIRN_IMAGE` (the busybox one below is the default):
 
