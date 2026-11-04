@@ -37,20 +37,16 @@ jobs:
         with:
           repository: heedle-ai/draft
           path: draft
-      - name: private-reed
-        # read-only deploy key on heedle-ai/reed
+      - name: sibling-reed
         uses: actions/checkout@v4
         with:
           repository: heedle-ai/reed
           path: reed
-          ssh-key: ${{ secrets.REED_DEPLOY_KEY }}
-      - name: private-bobbin
-        # read-only deploy key on heedle-ai/bobbin
+      - name: sibling-bobbin
         uses: actions/checkout@v4
         with:
           repository: heedle-ai/bobbin
           path: bobbin
-          ssh-key: ${{ secrets.BOBBIN_DEPLOY_KEY }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: pirn/go.mod
