@@ -45,11 +45,41 @@ go run ./cmd/loom run '(pipe
 
 The two pages are fetched in parallel, each in a fresh browser that may reach only its own site; then Claude answers from their text. The run's commit records the pages and the answer, so running it again tomorrow and diffing the two commits shows what changed.
 
-On macOS, reed's browser image must be built inside Linux, which reed lists as **Planned**; `ask` itself works on both.
+On macOS, run it through [heedle](https://github.com/heedle-ai/heedle/wiki/Getting-Started): `heedle up` downloads reed's published browser image, built for Linux arm64, into Podman's virtual machine. `ask` itself works on both.
 
 ## 4. Agent steps
 
-An agent needs an image with a shell. Any content-pinned image with `/bin/sh` and a writable `/work` (or one root can create) works: build your own with the tools your agents need, then give its ID to the worker:
+An agent needs an image with a shell. Any content-pinned image with `/bin/sh` and a writable `/work` (or one root can create) works.
+
+### The published agent image
+
+`ghcr.io/heedle-ai/pirn-agent` is built from `images/agent/Containerfile` by `.github/workflows/image.yml`, for Linux amd64 and arm64 (the architecture of a Mac's Podman machine). heedle pins it by digest, so `heedle up` downloads it once and gives it to its worker.
+
+It is Debian bookworm (`debian:bookworm-slim`, pinned by digest) with these packages, and nothing else is installed:
+
+| Package | Why |
+|---|---|
+| `bash` | the shell most agent commands are written for; `/bin/sh` is Debian's dash |
+| `coreutils` | `ls`, `cat`, `sort`, `tr`, `wc` and the rest of the basic file tools |
+| `curl` | fetching over HTTP(S) where a step's network allows it |
+| `ca-certificates` | so `curl`, `git` and Python can check HTTPS certificates |
+| `git` | cloning and diffing, which agents use for code and for comparing files |
+| `jq` | reading and reshaping JSON, the format most inputs and APIs use |
+| `python3` | scripts for anything the shell tools can't do comfortably |
+
+It runs as `agent` (uid 1000), not root, in `/work`, which that user owns. Every package added needs a row in this table: `TestInv_AgentImageIsPinnedAndUnprivileged` fails otherwise.
+
+The workflow runs from the Actions tab (**Image → Run workflow**) or on a tag `image-v*`. Each architecture is built on its own runner, checked for the tools above, the user and `/work`, and must pass the agent container tests in real sessions before it is saved; only then are both pushed by digest, under one manifest list. The run's summary names the manifest list's digest, which is what heedle pins. The tag pushed with it (the `image-v*` tag, or `run-<run ID>`) is only a label.
+
+To run those tests against an image of your own, give its ID as `PIRN_IMAGE` (the busybox one below is the default):
+
+```bash
+PIRN_IMAGE=<image ID> PIRN_REQUIRE_PODMAN=1 go test -count=1 -v -run '^(TestContainer_AgentInARealSession|TestContainer_AgentKeepsAwkwardFiles|TestContainer_AgentFollowsASkill)$' .
+```
+
+### Your own image
+
+Build one with the tools your agents need, then give its ID to the worker, or after `--` with heedle (`heedle up -- -agent-image <image ID>`):
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-... go run ./cmd/loom worker -store ~/heedle-store.git -agent-image <image ID>

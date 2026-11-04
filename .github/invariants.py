@@ -9,7 +9,7 @@ docs -> code
     `TestX`, `FuzzX`, `ExampleX` or `ci:NAME`.
   * Every named test exists in exactly one package (go test -list), and
     passes without being skipped (it is run here with -v).
-  * Every `ci:NAME` is a step named NAME in .github/workflows/ci.yml.
+  * Every `ci:NAME` is a step named NAME in a workflow in .github/workflows/.
 code -> docs
   * Every TestLaw_*, TestInv_* and Fuzz* test is a guard in some row.
   * No test file uses a build constraint, which would hide tests from all
@@ -103,13 +103,16 @@ if runnable:
     if p.returncode != 0:
         err("guard tests failed:\n" + "\n".join(l for l in p.stdout.splitlines() if "FAIL" in l or "_test.go" in l)[:2000])
 
-# --- ci: guards must be real step names ------------------------------------
-steps = set()
-if os.path.exists(".github/workflows/ci.yml"):
-    steps = set(re.findall(r"^\s*- name: ([A-Za-z0-9_-]+)\s*$", open(".github/workflows/ci.yml").read(), re.M))
+# --- ci: guards must be real step names, each in exactly one workflow ------
+steps = {}  # step name -> workflow files
+for wf in sorted(glob.glob(".github/workflows/*.yml")):
+    for name in re.findall(r"^\s*- name: ([A-Za-z0-9_-]+)\s*$", open(wf).read(), re.M):
+        steps.setdefault(name, set()).add(wf)
 for g in sorted(listed_ci):
     if g not in steps:
-        err(f"Invariants.md names ci:{g}, but ci.yml has no step named {g}")
+        err(f"Invariants.md names ci:{g}, but no workflow has a step named {g}")
+    elif len(steps[g]) > 1:
+        err(f"ci:{g} is a step in {len(steps[g])} workflows ({', '.join(sorted(steps[g]))}); rename one so the guard is unambiguous")
 
 # --- wiki images ------------------------------------------------------------
 for page in glob.glob("docs/wiki/*.md"):

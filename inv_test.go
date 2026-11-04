@@ -108,3 +108,74 @@ func TestInv_CIChecksCanFail(t *testing.T) {
 		}
 	}
 }
+
+// TestInv_AgentImageIsTestedBeforeItIsPublished: the agent image is built
+// on both Linux architectures, each passes the agent container tests
+// (ci:image-tested) before it is saved, and only a job that needs both
+// builds may push, by digest with a manifest list. (roadmap 9.1)
+func TestInv_AgentImageIsTestedBeforeItIsPublished(t *testing.T) {
+	b, err := os.ReadFile(".github/workflows/image.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{"runner: ubuntu-24.04 ", "runner: ubuntu-24.04-arm ", "\n  publish:\n    needs: build\n", "podman manifest push --all --digestfile", "-f images/agent/Containerfile"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("image.yml lacks %q", want)
+		}
+	}
+	publish := strings.Index(s, "\n  publish:\n")
+	order := []string{"- name: build\n", "- name: image-tested\n", "- name: save\n", "actions/upload-artifact"}
+	last := -1
+	for _, step := range order {
+		i := strings.Index(s, step)
+		if i < 0 || i < last || (publish >= 0 && i > publish) {
+			t.Errorf("image.yml: the build job must run %q in this order, before publish: %v", step, order)
+		}
+		last = i
+	}
+	for _, w := range []string{"packages: write", "podman login", "manifest push"} {
+		if i := strings.Index(s, w); i < 0 || publish < 0 || i < publish {
+			t.Errorf("image.yml: %q may appear only in the publish job", w)
+		}
+	}
+	if strings.Contains(s, "podman push") {
+		t.Error("image.yml: images are pushed only with their manifest list (podman manifest push --all)")
+	}
+}
+
+// TestInv_AgentImageIsPinnedAndUnprivileged: the agent image's base is
+// pinned by digest, it runs as an unprivileged user that owns /work, and
+// every package it installs is listed, with why, on Getting Started.
+// (roadmap 9.1)
+func TestInv_AgentImageIsPinnedAndUnprivileged(t *testing.T) {
+	b, err := os.ReadFile("images/agent/Containerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf := string(b)
+	if !regexp.MustCompile(`(?m)^FROM docker\.io/library/debian@sha256:[0-9a-f]{64}$`).MatchString(cf) || strings.Count(cf, "\nFROM ") != 1 {
+		t.Error("the Containerfile must have one FROM, a Debian image pinned by digest")
+	}
+	if strings.Contains(cf, ":latest") {
+		t.Error("the Containerfile uses :latest")
+	}
+	for _, want := range []string{"useradd --uid 1000 ", "chown agent:agent /work", "\nUSER agent\n", "\nWORKDIR /work\n"} {
+		if !strings.Contains(cf, want) {
+			t.Errorf("the Containerfile lacks %q", want)
+		}
+	}
+	if i, j := strings.Index(cf, "\nUSER agent\n"), strings.LastIndex(cf, "\nRUN "); i < j {
+		t.Error("the Containerfile runs something as root after USER agent")
+	}
+	m := regexp.MustCompile(`--no-install-recommends ([a-z0-9. +-]+?) \\`).FindStringSubmatch(cf)
+	if m == nil {
+		t.Fatal("no apt-get install --no-install-recommends line")
+	}
+	gs, _ := os.ReadFile("docs/wiki/Getting-Started.md")
+	for _, p := range strings.Fields(m[1]) {
+		if !strings.Contains(string(gs), "| `"+p+"` |") {
+			t.Errorf("package %s isn't listed, with why, on Getting Started", p)
+		}
+	}
+}

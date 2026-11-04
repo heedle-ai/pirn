@@ -1,0 +1,17 @@
+# The published agent image, ghcr.io/heedle-ai/pirn-agent: a shell and a
+# few common tools for agent steps, running as an unprivileged user with a
+# writable /work. Built for linux/amd64 and linux/arm64 by
+# .github/workflows/image.yml, which tests it before publishing it.
+#
+# Each package is listed, with why, on the wiki's Getting Started page;
+# TestInv_AgentImageIsPinnedAndUnprivileged keeps the two in step.
+FROM docker.io/library/debian@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bash coreutils curl ca-certificates git jq python3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --uid 1000 --user-group --create-home --shell /bin/bash agent \
+ && mkdir /work \
+ && chown agent:agent /work
+USER agent
+ENV HOME=/home/agent
+WORKDIR /work
