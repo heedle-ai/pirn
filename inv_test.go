@@ -152,6 +152,36 @@ func TestInv_AgentImageIsTestedBeforeItIsPublished(t *testing.T) {
 	if !strings.Contains(s, "fail-fast: true") || !strings.Contains(s, "if-no-files-found: error") {
 		t.Error("image.yml: both architectures must build, and both archives must exist, or nothing is published")
 	}
+	// Review 36, round 2: the image the tests run against must be the one
+	// built, and the one saved and published; the tests must require Podman,
+	// fail on a skip, and each expected pass must be checked.
+	build := s[:max(publish, 0)]
+	for _, bad := range []string{"||", "; true", "--from"} {
+		if strings.Contains(build, bad) {
+			t.Errorf("image.yml's build job uses %q", bad)
+		}
+	}
+	want := map[string][]string{
+		"build": {"id=$(podman build --quiet ", `echo "PIRN_IMAGE=$id" >> "$GITHUB_ENV"` + "\n"},
+		"image-tested": {
+			`PIRN_REQUIRE_PODMAN: "1"` + "\n",
+			"go test -count=1 -v -run '^(TestContainer_AgentInARealSession|TestContainer_AgentKeepsAwkwardFiles|TestContainer_AgentFollowsASkill)$' . | tee image-tested.log\n",
+			"if grep -q -- '--- SKIP' image-tested.log; then echo 'a test skipped'; exit 1; fi\n",
+			"grep -q -- '--- PASS: TestContainer_AgentInARealSession' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_AgentKeepsAwkwardFiles' image-tested.log\n",
+			"grep -q -- '--- PASS: TestContainer_AgentFollowsASkill' image-tested.log\n",
+		},
+		"save":   {`"$PIRN_IMAGE"` + "\n"},
+		"podman": {"--add-subuids 100000-165535 --add-subgids 100000-165535"},
+	}
+	for name, lines := range want {
+		step := agentImageStep(build, name)
+		for _, l := range lines {
+			if !strings.Contains(step, l) {
+				t.Errorf("image.yml's %s step lacks %q", name, strings.TrimSpace(l))
+			}
+		}
+	}
 	if regexp.MustCompile(`(?:docker\.io/|debian:)`).MatchString(s) {
 		t.Error("image.yml names a base image; the agent image's base is its Containerfile's, pinned by digest")
 	}
@@ -191,4 +221,18 @@ func TestInv_AgentImageIsPinnedAndUnprivileged(t *testing.T) {
 			t.Errorf("package %s isn't listed, with why, on Getting Started", p)
 		}
 	}
+}
+
+// agentImageStep is the text of the step called name in a workflow's job, up to
+// the next step.
+func agentImageStep(job, name string) string {
+	i := strings.Index(job, "- name: "+name+"\n")
+	if i < 0 {
+		return ""
+	}
+	rest := job[i+len("- name: "+name+"\n"):]
+	if j := strings.Index(rest, "\n      - "); j >= 0 {
+		rest = rest[:j+1]
+	}
+	return rest
 }
