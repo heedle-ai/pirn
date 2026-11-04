@@ -142,6 +142,19 @@ func TestInv_AgentImageIsTestedBeforeItIsPublished(t *testing.T) {
 	if strings.Contains(s, "podman push") {
 		t.Error("image.yml: images are pushed only with their manifest list (podman manifest push --all)")
 	}
+	// Review 36: nothing may let a step or job be skipped or its failure
+	// ignored, which these string checks alone would not notice.
+	for _, bad := range []string{"continue-on-error", "|| true", "|| :", "if: ", "${{ always", "${{ failure", "if-no-files-found: ignore", "if-no-files-found: warn"} {
+		if strings.Contains(s, bad) {
+			t.Errorf("image.yml uses %q, which could publish an untested image or hide a failure", bad)
+		}
+	}
+	if !strings.Contains(s, "fail-fast: true") || !strings.Contains(s, "if-no-files-found: error") {
+		t.Error("image.yml: both architectures must build, and both archives must exist, or nothing is published")
+	}
+	if regexp.MustCompile(`(?:docker\.io/|debian:)`).MatchString(s) {
+		t.Error("image.yml names a base image; the agent image's base is its Containerfile's, pinned by digest")
+	}
 }
 
 // TestInv_AgentImageIsPinnedAndUnprivileged: the agent image's base is
