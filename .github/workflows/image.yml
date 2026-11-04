@@ -60,10 +60,18 @@ jobs:
           cache-dependency-path: pirn/go.sum
       - name: podman
         run: |
-          if command -v podman >/dev/null; then podman --version; exit 0; fi
-          sudo apt-get update >/dev/null
-          sudo apt-get install -y podman >/dev/null
+          if command -v podman >/dev/null; then :; else
+            sudo apt-get update >/dev/null
+            sudo apt-get install -y podman >/dev/null
+          fi
           podman --version
+          # Rootless Podman needs subordinate IDs for images with more than
+          # one owner (review 36: the arm64 runner's were never checked).
+          if grep -q "^$USER:" /etc/subuid && grep -q "^$USER:" /etc/subgid; then :; else
+            sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+            podman system migrate
+          fi
+          podman info --format '{{.Host.IDMappings.UIDMap}}'
       - name: build
         working-directory: pirn
         run: |
