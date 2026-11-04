@@ -355,3 +355,61 @@ exit 0
 		t.Errorf("a locked keyring: %v", err)
 	}
 }
+
+// TestInv_ReadyAgreesWithRuns: a connector is called ready exactly when a
+// step starting now would get it: the worker grants what's asked
+// (grantFor) and every key it needs can be read (secretFor); otherwise
+// Ready says why, naming the key. (Roadmap 8.2.)
+func TestInv_ReadyAgreesWithRuns(t *testing.T) {
+	ctx := context.Background()
+	env := map[string]string{"ENV_KEY": "e"}
+	getenv = func(k string) string { return env[k] }
+	t.Cleanup(func() { getenv = os.Getenv })
+	v := fakeVault{"MAPS_KEY": "m", "SEARCH_KEY": "s"}
+	cs := Connectors{
+		{Name: "maps", URL: "https://maps.example/mcp", TokenEnv: "MAPS_KEY", Tools: []string{"search", "directions"}},
+		{Name: "search", Image: "img", Command: []string{"s"}, Secrets: map[string]string{"API_KEY": "SEARCH_KEY", "OTHER": "ENV_KEY"}},
+		{Name: "mail", URL: "https://mail.example/mcp", TokenEnv: "MAIL_KEY"},
+		{Name: "locked", URL: "https://l.example/mcp", TokenEnv: "BROKEN"},
+		{Name: "open", URL: "https://open.example/mcp"},
+	}
+	for _, c := range []struct {
+		grant, problem, key string
+	}{
+		{"maps", "tools", ""}, {"maps/search", "", ""}, {"maps/search maps/save", "tools", ""},
+		{"search", "", ""}, {"mail", "key", "MAIL_KEY"}, {"locked", "unreadable", "BROKEN"},
+		{"open", "", ""}, {"calendar", "absent", ""},
+	} {
+		g, err := ParseGrant(strings.Fields(c.grant))
+		if err != nil {
+			t.Fatal(err)
+		}
+		needs := cs.Ready(ctx, g, v)
+		if len(needs) != 1 || needs[0].Problem != c.problem || needs[0].Key != c.key {
+			t.Errorf("%s: %+v, want problem %q key %q", c.grant, needs, c.problem, c.key)
+			continue
+		}
+		// The run's own view: the grant, then each key.
+		runOK := true
+		if _, err := cs.grantFor(g); err != nil {
+			runOK = false
+		} else {
+			conn, _ := cs.Find(g.Connectors()[0])
+			if _, err := conn.token(ctx, v); err != nil {
+				runOK = false
+			}
+			if _, err := conn.secrets(ctx, v); err != nil {
+				runOK = false
+			}
+		}
+		if runOK != (needs[0].Problem == "") {
+			t.Errorf("%s: Ready says %q, but a run would %s", c.grant, needs[0].Problem, map[bool]string{true: "start", false: "fail"}[runOK])
+		}
+	}
+	if n := cs.Ready(ctx, Grant{}, v); len(n) != 0 {
+		t.Errorf("no grant, no needs: %+v", n)
+	}
+	if n := (Connectors{{Name: "maps", URL: "https://m", TokenEnv: "MAPS_KEY"}}).Ready(ctx, Grant{"maps": {All: true}}, nil); n[0].Problem != "key" {
+		t.Errorf("no vault: %+v", n)
+	}
+}
