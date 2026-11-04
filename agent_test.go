@@ -270,10 +270,15 @@ var shellImageOnce = sync.OnceValues(func() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 })
 
-// shellImage is a FROM scratch image with a static busybox. Without podman
-// and busybox the test skips, unless PIRN_REQUIRE_PODMAN=1 (CI).
+// shellImage is the image agent steps run in: PIRN_IMAGE if it is set (the
+// image workflow tests the agent image it is about to publish this way),
+// else a FROM scratch image with a static busybox. Without podman and
+// busybox the test skips, unless PIRN_REQUIRE_PODMAN=1 (CI).
 func shellImage(t *testing.T) string {
 	t.Helper()
+	if img := os.Getenv("PIRN_IMAGE"); img != "" {
+		return img
+	}
 	id, err := shellImageOnce()
 	if err != nil {
 		if os.Getenv("PIRN_REQUIRE_PODMAN") == "1" {

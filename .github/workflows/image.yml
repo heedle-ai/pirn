@@ -1,0 +1,125 @@
+name: Image
+
+# Builds the published agent image, ghcr.io/heedle-ai/pirn-agent, from
+# images/agent/Containerfile for linux/amd64 and linux/arm64, tests each
+# with pirn's agent container tests, and only then pushes both by digest
+# with a manifest list over them. heedle pins the manifest list's digest;
+# the tag pushed with it is a label for people, never what anything pulls.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['image-v*']
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # bash -eo pipefail: a failing command in a pipe fails the step.
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04       # linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm   # linux/arm64, what a Mac's Podman machine runs
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pirn
+      - uses: actions/checkout@v4      # go.mod replaces the heedle-ai modules with ../
+        with:
+          repository: heedle-ai/weft
+          path: weft
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/shuttle
+          path: shuttle
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/draft
+          path: draft
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/reed
+          path: reed
+      - uses: actions/checkout@v4
+        with:
+          repository: heedle-ai/bobbin
+          path: bobbin
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: pirn/go.mod
+          cache-dependency-path: pirn/go.sum
+      - name: podman
+        run: |
+          if command -v podman >/dev/null; then podman --version; exit 0; fi
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y podman >/dev/null
+          podman --version
+      - name: build
+        working-directory: pirn
+        run: |
+          id=$(podman build --quiet -f images/agent/Containerfile images/agent | tail -1)
+          arch=$(podman image inspect --format '{{.Architecture}}' "$id")
+          if [ "$arch" != "${{ matrix.arch }}" ]; then echo "built $arch, want ${{ matrix.arch }}"; exit 1; fi
+          # The tools the wiki promises, an unprivileged user, a writable /work.
+          podman run --rm --entrypoint /bin/sh "$id" -c \
+            'set -e; for c in bash curl git jq python3; do command -v "$c"; done; test "$(id -u)" -ne 0; test -w /work; test "$PWD" = /work'
+          echo "PIRN_IMAGE=$id" >> "$GITHUB_ENV"
+      # The image that is published passes pirn's agent container tests
+      # first, on its own architecture, in real sessions; skipping fails.
+      - name: image-tested
+        working-directory: pirn
+        env:
+          PIRN_REQUIRE_PODMAN: "1"
+        run: |
+          go test -count=1 -v -run '^(TestContainer_AgentInARealSession|TestContainer_AgentKeepsAwkwardFiles|TestContainer_AgentFollowsASkill)$' . | tee image-tested.log
+          if grep -q -- '--- SKIP' image-tested.log; then echo 'a test skipped'; exit 1; fi
+          grep -q -- '--- PASS: TestContainer_AgentInARealSession' image-tested.log
+          grep -q -- '--- PASS: TestContainer_AgentKeepsAwkwardFiles' image-tested.log
+          grep -q -- '--- PASS: TestContainer_AgentFollowsASkill' image-tested.log
+      - name: save
+        run: podman save --format oci-archive -o "$RUNNER_TEMP/pirn-agent-${{ matrix.arch }}.tar" "$PIRN_IMAGE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pirn-agent-${{ matrix.arch }}
+          path: ${{ runner.temp }}/pirn-agent-${{ matrix.arch }}.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  # Runs only when both architectures built and passed their tests.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pirn-agent-*
+          path: ${{ runner.temp }}/images
+          merge-multiple: true
+      - name: publish
+        env:
+          REPO: ghcr.io/heedle-ai/pirn-agent
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag=$GITHUB_REF_NAME; else tag="run-$GITHUB_RUN_ID"; fi
+          echo "$TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          podman manifest create pirn-agent
+          for arch in amd64 arm64; do
+            podman manifest add pirn-agent "oci-archive:$RUNNER_TEMP/images/pirn-agent-$arch.tar"
+          done
+          podman manifest push --all --digestfile digest pirn-agent "docker://$REPO:$tag"
+          ref="$REPO@$(cat digest)"
+          echo "$ref"
+          echo "Published \`$ref\` (tag \`$tag\`). Pin it in heedle's images.json as \"agent\"." >> "$GITHUB_STEP_SUMMARY"
