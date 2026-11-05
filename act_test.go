@@ -83,8 +83,14 @@ func fakeBrowser() *mcp.Server {
 		if !strings.Contains(fn, `"password"`) {
 			panic("browser_evaluate ran " + fn)
 		}
-		yes := target == "e9" || (target == "" && strings.Contains(fn, "activeElement") && focused == "e9")
-		return text(fmt.Sprintf("### Result\n%v\n### Ran Playwright code\n```js\n```", yes)), nil, nil
+		if target == "e7" { // an element the browser can't answer about
+			return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "### Error\nTimeout"}}}, nil, nil
+		}
+		answer := "no"
+		if target == "e9" || (target == "" && strings.Contains(fn, "activeElement") && focused == "e9") {
+			answer = "yes"
+		}
+		return text(fmt.Sprintf("### Result\n%q\n### Ran Playwright code\n```js\n```", answer)), nil, nil
 	})
 	for _, name := range []string{"browser_run_code_unsafe", "browser_file_upload", "browser_drag"} {
 		name := name
@@ -649,16 +655,20 @@ func TestInv_ActNeverTypesAPassword(t *testing.T) {
 		actTurn("tool_use", browserUse("t3", "browser_click", `{"element":"Password","target":"e9"}`)),
 		actTurn("tool_use", browserUse("t4", "browser_press_key", `{"key":"h"}`)),
 		actTurn("tool_use", browserUse("t5", "browser_type", `{"element":"Email","target":"e5","text":"ada@example.org"}`)),
+		// Review 40: a Tab typed key by key moves to the next field, and a
+		// field the browser can't answer about is taken for a password.
+		actTurn("tool_use", browserUse("t6", "browser_type", `{"element":"Email","target":"e5","text":"ada@example.org\thunter2","slowly":true}`)),
+		actTurn("tool_use", browserUse("t7", "browser_type", `{"element":"Secret","target":"e7","text":"hunter2"}`)),
 		actTurn("end_turn", `{"type":"text","text":"The form asks for a password.\nResult: stopped"}`))
 	a, b := newAct(t, api)
 	res, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "Change the address.", URL: "https://forms.example.org/volunteer"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Calls) != 5 {
+	if len(res.Calls) != 7 {
 		t.Fatalf("calls: %+v", res.Calls)
 	}
-	for _, i := range []int{0, 1, 3} {
+	for _, i := range []int{0, 1, 3, 5, 6} {
 		if c := res.Calls[i]; !c.IsError || !strings.Contains(c.Output, "password field") || c.Shot != "" {
 			t.Errorf("call %d %s ran: %+v", i, c.Tool, c)
 		}
@@ -674,5 +684,9 @@ func TestInv_ActNeverTypesAPassword(t *testing.T) {
 	log, _ := os.ReadFile(b.calls)
 	if strings.Contains(string(log), "hunter2") {
 		t.Errorf("the password reached the browser:\n%s", log)
+	}
+	// Nor is it in the record (review 40).
+	if out := string(must(json.Marshal(res))); strings.Contains(out, "hunter2") {
+		t.Errorf("the record keeps what wasn't typed:\n%s", out)
 	}
 }
