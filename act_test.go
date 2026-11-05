@@ -92,7 +92,19 @@ func fakeBrowser() *mcp.Server {
 		}
 		return text(fmt.Sprintf("### Result\n%q\n### Ran Playwright code\n```js\n```", answer)), nil, nil
 	})
-	for _, name := range []string{"browser_run_code_unsafe", "browser_file_upload", "browser_drag"} {
+	// act opens reed's hold and reads what it held (roadmap 9.7); Claude
+	// never gets this tool.
+	mcp.AddTool(s, &mcp.Tool{Name: "browser_run_code_unsafe"}, func(_ context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
+		log("browser_run_code_unsafe", map[string]any{"code": map[bool]string{true: "release", false: "held"}[in["code"] == reed.ReleaseJS]})
+		switch in["code"] {
+		case reed.ReleaseJS:
+			return text("### Result\n\"released\"\n"), nil, nil
+		case reed.HeldJS:
+			return text("### Result\n{\"held\":[\"POST https://forms.example.org/volunteer/2\"],\"total\":1}\n"), nil, nil
+		}
+		panic("browser_run_code_unsafe ran " + fmt.Sprint(in["code"]))
+	})
+	for _, name := range []string{"browser_file_upload", "browser_drag"} {
 		name := name
 		mcp.AddTool(s, &mcp.Tool{Name: name}, func(_ context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
 			log(name, in)
@@ -144,6 +156,15 @@ type fakeSession struct {
 	calls   string
 	env     string
 	closed  bool
+	freely  bool
+}
+
+func (s *fakeSession) SendWithoutAsking(context.Context) error {
+	s.freely = true
+	f, _ := os.OpenFile(s.calls, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	fmt.Fprintln(f, "send-without-asking {}")
+	f.Close()
+	return nil
 }
 
 func (s *fakeSession) Command(ctx context.Context) *exec.Cmd {
@@ -265,6 +286,7 @@ func TestInv_ActRecordsEveryAction(t *testing.T) {
 	for _, n := range reed.ActTools {
 		want = append(want, "browser__"+n)
 	}
+	want = append(want, pirn.ConfirmTool) // roadmap 9.7
 	sort.Strings(want)
 	if strings.Join(names, " ") != strings.Join(want, " ") {
 		t.Errorf("Claude was offered %v", names)
@@ -281,7 +303,7 @@ func TestInv_ActRecordsEveryAction(t *testing.T) {
 	if strings.Count(string(msg), `\u003cinstruction\u003e`) != 1 || strings.Count(string(msg), `\u003c/source\u003e`) != 1 {
 		t.Errorf("an input forged the instruction tag: %s", msg)
 	}
-	if c := strings.Join(calls(t, b), " "); c != "browser_navigate browser_tabs browser_take_screenshot browser_snapshot browser_tabs browser_evaluate browser_fill_form browser_tabs browser_take_screenshot browser_click browser_tabs browser_take_screenshot browser_network_requests" {
+	if c := strings.Join(calls(t, b), " "); c != "browser_navigate browser_tabs browser_take_screenshot browser_snapshot browser_tabs browser_evaluate browser_fill_form browser_tabs browser_take_screenshot browser_click browser_tabs browser_take_screenshot browser_network_requests browser_run_code_unsafe" {
 		t.Errorf("the browser ran: %s", c)
 	}
 }
@@ -322,7 +344,7 @@ func TestInv_ActOffersOnlyFormTools(t *testing.T) {
 			t.Errorf("%s: %+v", c.Tool, c)
 		}
 	}
-	if c := strings.Join(calls(t, b), " "); c != "browser_network_requests" {
+	if c := strings.Join(calls(t, b), " "); c != "browser_network_requests browser_run_code_unsafe" {
 		t.Errorf("the browser ran: %s", c)
 	}
 }
@@ -398,7 +420,7 @@ func TestInv_ActRunsOnce(t *testing.T) {
 
 // TestInv_ParseActIsStrict: only an act output reads as one.
 func TestInv_ParseActIsStrict(t *testing.T) {
-	ok := `{"pirn":1,"model":"m","text":"t","stopReason":"end_turn","inputTokens":1,"outputTokens":1,"act":1,"image":"i","turns":1,"calls":[{"tool":"browser_click","input":"{}","screenshot":"data:image/jpeg;base64,AA=="}],"url":"u","allowed":["a"],"blocked":[],"blockedTotal":0,"inputs":[],"ended":"finished"}`
+	ok := `{"pirn":1,"model":"m","text":"t","stopReason":"end_turn","inputTokens":1,"outputTokens":1,"act":1,"image":"i","turns":1,"calls":[{"tool":"browser_click","input":"{}","screenshot":"data:image/jpeg;base64,AA=="}],"url":"u","allowed":["a"],"blocked":[],"blockedTotal":0,"inputs":[],"ended":"finished","held":[],"heldTotal":0}`
 	if _, good := pirn.ParseAct(ok); !good {
 		t.Fatal("a good output didn't parse")
 	}
@@ -637,7 +659,7 @@ func TestInv_ActRecordIsBounded(t *testing.T) {
 	if !strings.Contains(res.Calls[len(res.Calls)-1].Output, "limit of") {
 		t.Errorf("last call: %+v", res.Calls[len(res.Calls)-1])
 	}
-	if c := strings.Join(calls(t, b), " "); c != "browser_network_requests" {
+	if c := strings.Join(calls(t, b), " "); c != "browser_network_requests browser_run_code_unsafe" {
 		t.Errorf("the browser ran: %s", c)
 	}
 }
@@ -688,5 +710,138 @@ func TestInv_ActNeverTypesAPassword(t *testing.T) {
 	// Nor is it in the record (review 40).
 	if out := string(must(json.Marshal(res))); strings.Contains(out, "hunter2") {
 		t.Errorf("the record keeps what wasn't typed:\n%s", out)
+	}
+}
+
+// TestInv_ActAsksBeforeSending: Claude is offered confirm and told to
+// call it before each click that sends a form (roadmap 9.7). A confirm
+// call shows the person the summary and a screenshot (the heartbeat
+// carries the pending send), waits with the step's budget standing still,
+// and on a yes opens reed's hold for one send; a no ends the step,
+// nothing after it run; no answer in time, no way to ask, or more sends
+// than MaxConfirmations send nothing either. Every confirm is recorded,
+// and what the hold held is in the record.
+func TestInv_ActAsksBeforeSending(t *testing.T) {
+	confirm := use("c1", pirn.ConfirmTool, `{"summary":"Name Ada, email ada@example.org."}`)
+	click := browserUse("t2", "browser_click", `{"element":"Next","target":"e8"}`)
+	run := func(t *testing.T, a pirn.Act, api *actAPI) (pirn.ActResult, []pirn.ActPending) {
+		var seen []pirn.ActPending
+		a.OnProgress = func(r pirn.ActResult, f reed.Frame) {
+			if r.Pending != nil && (len(seen) == 0 || seen[len(seen)-1].ID != r.Pending.ID) {
+				seen = append(seen, *r.Pending)
+				if len(f.JPEG) == 0 {
+					t.Error("a pending send without its screenshot")
+				}
+			}
+		}
+		res, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "Sign up.", URL: "https://forms.example.org/volunteer"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := pirn.ParseAct(string(must(json.Marshal(res)))); !ok {
+			t.Error("not a strict act output")
+		}
+		return res, seen
+	}
+
+	t.Run("yes", func(t *testing.T) {
+		api := newActAPI(t, actTurn("tool_use", confirm), actTurn("tool_use", click), actTurn("end_turn", `{"type":"text","text":"Sent.\nResult: finished"}`))
+		a, b := newAct(t, api)
+		a.Budget = 4 * time.Second // the wait doesn't count against it
+		var asked pirn.ActPending
+		a.Confirm = func(_ context.Context, p pirn.ActPending) (bool, error) {
+			asked = p
+			time.Sleep(6 * time.Second) // longer than the whole budget
+			return true, nil
+		}
+		res, seen := run(t, a, api)
+		if res.Ended != pirn.EndedFinished || len(res.Calls) != 2 || res.Calls[0].Tool != pirn.ConfirmTool || res.Calls[0].IsError || res.Calls[0].Shot == "" ||
+			asked.Summary != "Name Ada, email ada@example.org." || len(asked.ID) != 16 || len(seen) != 1 || seen[0].ID != asked.ID {
+			t.Fatalf("%+v; asked %+v; seen %+v", res, asked, seen)
+		}
+		if c := strings.Join(calls(t, b), " "); !strings.Contains(c, "browser_run_code_unsafe browser_click") {
+			t.Errorf("the hold wasn't opened before the click: %s", c)
+		}
+		if strings.Join(res.Held, " ") != "POST https://forms.example.org/volunteer/2" || res.HeldTotal != 1 {
+			t.Errorf("held: %v %d", res.Held, res.HeldTotal)
+		}
+		sys, _ := json.Marshal(api.reqs[0]["system"])
+		if !strings.Contains(string(sys), "call confirm") {
+			t.Errorf("not told to confirm: %s", sys)
+		}
+	})
+	for name, c := range map[string]struct {
+		confirm func(context.Context, pirn.ActPending) (bool, error)
+		say     string
+	}{
+		"no":        {func(context.Context, pirn.ActPending) (bool, error) { return false, nil }, "cancelled"},
+		"no answer": {func(ctx context.Context, _ pirn.ActPending) (bool, error) { <-ctx.Done(); return false, ctx.Err() }, "no one confirmed"},
+		"no one":    {nil, "no one can confirm"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newActAPI(t, actTurn("tool_use", confirm, click), actTurn("tool_use", click), actTurn("end_turn", `{"type":"text","text":"x"}`))
+			a, b := newAct(t, api)
+			a.Confirm, a.ConfirmWithin = c.confirm, 500*time.Millisecond
+			res, _ := run(t, a, api)
+			if res.Ended != pirn.EndedCancelled || len(res.Calls) != 1 || !strings.Contains(res.Text, c.say) || !strings.Contains(res.Calls[0].Output, "Not sent") {
+				t.Fatalf("%+v", res)
+			}
+			if c := strings.Join(calls(t, b), " "); strings.Contains(c, "browser_click") || strings.Contains(c, "release") {
+				t.Errorf("acted after a send it wasn't let make: %s", c)
+			}
+			log, _ := os.ReadFile(b.calls)
+			if strings.Contains(string(log), `"code":"release"`) {
+				t.Errorf("the hold was opened: %s", log)
+			}
+		})
+	}
+	t.Run("too many", func(t *testing.T) {
+		var turns []string
+		for i := 0; i <= pirn.MaxConfirmations; i++ {
+			turns = append(turns, actTurn("tool_use", confirm))
+		}
+		api := newActAPI(t, append(turns, actTurn("end_turn", `{"type":"text","text":"x"}`))...)
+		a, _ := newAct(t, api)
+		a.Confirm = func(context.Context, pirn.ActPending) (bool, error) { return true, nil }
+		res, _ := run(t, a, api)
+		if res.Ended != pirn.EndedCancelled || len(res.Calls) != pirn.MaxConfirmations+1 || !strings.Contains(res.Text, "at most") {
+			t.Fatalf("%+v", res)
+		}
+	})
+}
+
+// TestInv_ActSendsWithoutAskingOnlyWhenTold: only a program's
+// :send-without-asking lets a step send without asking: then the hold is
+// lifted before the browser starts and Claude isn't offered confirm or
+// told to use it; any other option is invalid, and options are never
+// hosts. (Roadmap 9.7.)
+func TestInv_ActSendsWithoutAskingOnlyWhenTold(t *testing.T) {
+	api := newActAPI(t, actTurn("end_turn", `{"type":"text","text":"Done.\nResult: finished"}`))
+	a, b := newAct(t, api)
+	res, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "Sign up.", URL: "https://forms.example.org/", SendFreely: true})
+	if err != nil || !res.SendFreely {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if c := strings.Join(calls(t, b), " "); !strings.HasPrefix(c, "send-without-asking") {
+		t.Errorf("the hold wasn't lifted first: %s", c)
+	}
+	tools, _ := json.Marshal(api.reqs[0]["tools"])
+	sys, _ := json.Marshal(api.reqs[0]["system"])
+	if strings.Contains(string(tools), `"name":"confirm"`) || strings.Contains(string(sys), "call confirm") {
+		t.Errorf("offered confirm anyway: %s %s", tools, sys)
+	}
+	if h, ok := pirn.ActHosts([]string{"x", "https://forms.example.org/", "cdn.example.org", pirn.SendFreely}); !ok || strings.Join(h, " ") != "cdn.example.org forms.example.org" {
+		t.Errorf("hosts %v %v", h, ok)
+	}
+	if f, ok := pirn.ActSendsFreely([]string{"x", "https://forms.example.org/", pirn.SendFreely}); !f || !ok {
+		t.Error(":send-without-asking not read")
+	}
+	if f, ok := pirn.ActSendsFreely([]string{"x", "https://forms.example.org/"}); f || !ok {
+		t.Error("sends freely by default")
+	}
+	for _, bad := range [][]string{{"x", "https://forms.example.org/", ":uses"}, {"x", "https://forms.example.org/", pirn.SendFreely, pirn.SendFreely}} {
+		if _, ok := pirn.ActHosts(bad); ok {
+			t.Errorf("%v accepted", bad)
+		}
 	}
 }

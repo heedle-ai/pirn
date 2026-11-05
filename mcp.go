@@ -248,6 +248,14 @@ func (t *toolbox) add(ctx context.Context, c Connector, cs *mcp.ClientSession, o
 	return nil
 }
 
+// clientToolParam is a client tool's definition for Claude.
+func clientToolParam(name, desc string, properties any, required []string) anthropic.BetaToolUnionParam {
+	return anthropic.BetaToolUnionParam{OfTool: &anthropic.BetaToolParam{
+		Name: name, Description: param.NewOpt(desc),
+		InputSchema: anthropic.BetaToolInputSchemaParam{Properties: properties, Required: required},
+	}}
+}
+
 // connect speaks MCP over a transport, giving the server ListTimeout to
 // answer.
 func connect(ctx context.Context, tr mcp.Transport) (*mcp.ClientSession, error) {
