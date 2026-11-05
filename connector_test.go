@@ -53,6 +53,9 @@ func TestMain(m *testing.M) {
 		})
 		s.Run(context.Background(), &mcp.StdioTransport{})
 		return
+	case "browser": // a stand-in for Playwright MCP (act_test.go)
+		fakeBrowser().Run(context.Background(), &mcp.StdioTransport{})
+		return
 	case "silent": // never answers
 		io.Copy(io.Discard, os.Stdin)
 		return

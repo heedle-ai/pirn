@@ -20,7 +20,10 @@ import (
 // are registry.go, which alone may run a process and touch files (oras, on
 // a temporary copy of a file too big for the record); mcp.go, which alone
 // reaches MCP servers, through the official Go SDK (net/http only to give
-// that SDK a client that sends a remote server its token); connector.go,
+// that SDK a client that sends a remote server its token); act.go, which
+// starts an act step's Playwright MCP in reed's container (os/exec) and
+// speaks MCP to it with the same SDK (net/url reads its blocked requests;
+// roadmap 9.5); connector.go,
 // which reads tokens from the worker's environment; and vault.go, which
 // alone runs the keychain's own command (security or secret-tool) and
 // stty, to type a secret unseen.
@@ -53,6 +56,7 @@ func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 				"mcp.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/http", "github.com/anthropics/anthropic-sdk-go/packages/param"},
 				"connector.go": {"os", "net/url"},
 				"vault.go":     {"os", "os/exec", "runtime", "sync"},
+				"act.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/url", "os/exec"},
 			}
 			if !allowed[p] && !slices.Contains(except[f], p) {
 				bad = append(bad, f+": "+p)

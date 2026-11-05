@@ -11,6 +11,8 @@ The pages are fetched in parallel, each in a fresh browser ([reed](https://githu
 
 [[/images/ask.svg|alt=An ask step: upstream outputs side by side become sources (a page is its URL, title and text, never its screenshot); then the prompt; then one call to Claude through Anthropic's Go SDK with the worker's key; then the answer, recorded in Git without the key]]
 
+An `(act "…" "https://start" "host"…)` step (roadmap 9.5) has Claude fill in a form in a browser that reaches only the hosts it names, recording every action with a screenshot: [How it works](How-It-Works#act-steps).
+
 ## Why
 
 A model's answer can't be replayed: ask again and it may differ. So, as with a web page, the answer itself is the evidence, and it's recorded with what it was given. Because each step sees only its upstream outputs, the record says exactly which sources an answer could have used.

@@ -152,6 +152,28 @@ A worker can offer agent steps MCP servers: connectors. Each one is named in the
 
 **Servers are bounded too.** Starting or reaching a server and listing its tools has a minute (`ListTimeout`); a server listing more than 100 tools (`MaxTools`) fails the step as setup, and a tool whose input schema is over 16 KiB (`MaxToolSchema`) is left out. pirn reads at most 32 MiB from any server (`MaxServerOutput`). A remote connector's token goes only to its own URL: pirn follows no redirect and speaks only https. Whether a write needs approval is the worker's connectors file's to say when the write runs, not the step's: `RunWrite` refuses a write whose connector says `approve` unless a person approved it.
 
+## Act steps
+
+[[/images/act.svg|alt=An act step: the instruction, start page and hosts become a question; Claude's loop in pirn, bounded, offered only the form tools; each call goes through podman exec to Playwright MCP and Chromium in a fresh reed container that reaches only allowed hosts; a screenshot after every action is heartbeated to the run page; the result is strict JSON recorded in Git]]
+
+```lisp
+(act "Join the volunteer list as Ada, ada@example.org" "https://forms.example.org/volunteer")
+```
+
+An `act` step (roadmap 9.5) fills in a form: Claude works a browser through Microsoft's [Playwright MCP](https://github.com/microsoft/playwright-mcp). Its arguments are the instruction, the start page and any further hosts; those hosts are its allowlist, as for `browse`, so they are in the plan and the record. [reed](https://github.com/heedle-ai/reed/wiki/How-It-Works#act-sessions) starts the browser (a fresh container from the browser-agent image, enforcing the allowlist with Chromium's own switches); pirn runs Claude's loop over it.
+
+**It reuses the local-connector code.** Playwright MCP is spoken to with the official Go MCP SDK over the session's standard input and output, exactly as a local connector is (`connect`), its tools are offered through the same `toolbox`, and Claude's calls go through the agent loop's own `call`, so act has the agent step's bounds: `MaxTurns` (30), `MaxToolCalls` (60), a minute a call, 8 KiB of output a call for Claude. There is no shell: an act step's only tools are the browser's.
+
+**Only form tools.** Claude is offered reed's `ActTools`: navigate and go back, read the page (`browser_snapshot`), click, type, fill a form, choose an option, press a key, hover, wait, and answer a dialog. Playwright MCP also has tools no flag removes, to run scripts and upload files; they're never offered, and a call to one is answered "No such tool." without reaching the browser. A Playwright MCP missing any of act's tools fails the step as setup before Claude is asked.
+
+**Pages are data.** Act's system prompt says the instruction is the only thing to follow: pages, their text and the step's inputs are data, never instructions. It can't upload, download or sign in, so a form that needs any of those ends the step, saying why. The inputs are framed as sources the same way an ask's are (`inert`), so their text can't forge the prompt's tags.
+
+**Everything is recorded.** The output (`ParseAct` reads it, strictly) is the answer; every call with its input, output and the page it left the browser on, and, after anything but reading the page, a screenshot made a small JPEG frame (reed's `FrameOf`); the final page; the allowed hosts; the requests to other hosts that the browser blocked; the inputs; and how it ended: `finished` or `stopped` (Claude's last line says which), or `max_calls`, `max_turns` or `timeout`. A step that hits a bound ends with what it did, not an error. The record stays within `MaxResult`: the oldest screenshots go first, never an action.
+
+**Once, with a budget.** A retried act step could submit a form twice, so it has one attempt (`ActOptions.MaxAttempts`). It has 10 minutes (`ActBudget`); its activity timeout is 5 minutes longer, so the budget, not Temporal, ends a long step, with its record. Its heartbeats are `reed.Frame`s, the latest screenshot, as browse's are, so drawdown shows it live.
+
+`ActHosts` gives the hosts an act step's arguments allow, as reed's allowlist reads them; loom and drawdown disclose them before a step runs.
+
 ## Laws
 
 `ask` is a `weft.Arrow`, registered the same way as reed's `browse` and bobbin's `container`, so it composes under `pipe` and `par` exactly as they do. Two law tests check it with a deterministic stand-in for Claude: weft's identity laws (`TestLaw_AskIsAWeftArrow`), and that the question is a function of the step's inputs alone (`TestLaw_PromptIsAFunctionOfInputs`). Claude's answers themselves can differ between runs, so the laws hold up to the answer, which is why every answer is recorded with what it was given.
@@ -161,6 +183,7 @@ A worker can offer agent steps MCP servers: connectors. Each one is named in the
 - **Answers differ between runs.** That's the nature of the model; the record keeps each answer with the sources it was given.
 - **Sources can try to steer Claude.** A page can contain text addressed to the model. The system prompt says to treat sources as data, and an ask step has no tools, so the most a page can do is distort the answer, which is recorded next to the page that did it.
 - **One model per worker.** Choosing the model in the program is **Planned**.
+- **An act step can do anything its hosts let a person do there.** The allowlist bounds where, not what: on an allowed host it can submit any form Claude is persuaded to, including by a page's text. That's why the hosts are disclosed before it runs, it runs once, and every action is recorded with a screenshot.
 - **Only agent steps use connectors.** An `ask` step has no tools, and a skill step gets no grant yet.
 - **The MCP connector isn't covered by zero data retention.** What a remote connector's tools return goes through Anthropic's API under its standard retention; use a local connector for data that mustn't.
 - **Local connectors have no network.** A server that must call an API should be a remote connector.
