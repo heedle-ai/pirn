@@ -430,6 +430,15 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 				}
 				step, stepOK = scriptStep(b, pre, red)
 			}
+			if _, offered := tb.client[b.Name]; offered && q.SendFreely && !readsOnly[name] && !leaves(b, q.URL) && paymentPage(lctx, cs, pre) {
+				// Sending without asking never pays: on a page asking for
+				// a card, Claude puts nothing into a request: it may only
+				// read the page, go back, or open the step's start page
+				// (review 51, rounds 1 to 4: any other URL could carry a
+				// card's details, in its query, path or user info).
+				out = notPayment
+				break
+			}
 			if armed != nil {
 				outline := *armed
 				armed = nil // one action, whatever comes of it
@@ -794,6 +803,10 @@ func refuse(b anthropic.BetaContentBlockUnion, allowed []string) string {
 	}
 	return "Not run: this step may only open http or https pages on " + strings.Join(allowed, ", ") + "."
 }
+
+// notPayment answers a call that could send a payment in a step that may
+// send without asking.
+const notPayment = "Not run: this page asks for a card, and a step that sends without asking never pays or fills one in. Stop and say that the person must pay themselves."
 
 // notPassword answers a call that would type into a password field, or
 // type keys that move to another field.
