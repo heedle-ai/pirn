@@ -185,7 +185,9 @@ Every container pirn starts carries heedle's labels (roadmap 9.2), so heedle can
 | A local connector's MCP server, in a step or for a write | `connector` |
 | An act step's browser | `act` (reed sets it) |
 
-The run labels come from the step's context: the workflow that scheduled the step, its run, and the step's node ID. loom sets them where every step's activity starts. Otherwise the agent and act commands read them from Temporal's activity info with their own node ID, and `Step` and `RunWrite` read the workflow and run without a step. A write runs in the run's own workflow after its steps, so its connector names the run itself. bobbin and reed write the same names, read the same values from Temporal, and follow the same rule for what a value may be (`TestInv_LabelSchemesAgree`).
+The run labels come from the step's context: the workflow that scheduled the step, its run, and the step's node ID. loom sets them where every step's activity starts. Otherwise the agent and act commands read them from Temporal's activity info with their own node ID, and `Agent.Run` (so `Step` and a skill's creation), and `RunWrite`, read the workflow and run without a step. A write runs in the run's own workflow after its steps, so its connector names the run itself. bobbin and reed write the same names, read the same values from Temporal, and follow the same rule for what a value may be (`TestInv_LabelSchemesAgree`).
+
+Temporal tells a step it was cancelled (`loom cancel`, or Stop run in the UI) only when the step heartbeats. So an agent step running in an activity heartbeats every 10 seconds while it runs, as well as after each command, and a cancel reaches it even while it waits on Claude. A step that has made no progress for 4 minutes stops heartbeating, so Temporal still notices a hung step (`TestInv_AgentStepsHeartbeatWhileTheyWait`).
 
 ## Laws
 

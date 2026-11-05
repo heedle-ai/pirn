@@ -98,6 +98,25 @@ func TestInv_EveryContainerPirnStartsIsLabelled(t *testing.T) {
 		t.Errorf("skill step: %q, want %q", got, want)
 	}
 
+	// A skill's creation, as loom and drawdown run it: Agent.Run straight
+	// from an activity, with no step of its own. Review 50: its workspace
+	// had no run labels.
+	env = s.NewTestActivityEnvironment()
+	wf, run = execution(t, env)
+	podman, log = fakePodman(t, "ok")
+	a.Runner = bobbin.Runner{Podman: podman}
+	env.RegisterActivityWithOptions(func(ctx context.Context) (string, error) {
+		_, err := a.Run(ctx, pirn.Question{Instruction: "Write a weather skill."})
+		return "", err
+	}, activity.RegisterOptions{Name: "Create"})
+	if _, err := env.ExecuteActivity("Create"); err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"heedle.kind=agent", "heedle.workflow=" + wf, "heedle.run=" + run}
+	if got := runLabels(t, log); len(got) != 1 || !reflect.DeepEqual(got[0], want) {
+		t.Errorf("creating a skill: %q, want %q", got, want)
+	}
+
 	// A step with a local connector: its server and the workspace, both
 	// with the run labels the step's context carries.
 	t.Setenv("FILES_TOKEN", "files-secret")
