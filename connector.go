@@ -90,6 +90,9 @@ func (cs Connectors) Check() error {
 			if c.TokenEnv != "" && !envName.MatchString(c.TokenEnv) {
 				return bad("tokenEnv must name an environment variable")
 			}
+			if IsProfileName(c.TokenEnv) {
+				return bad("tokenEnv can't name one of your details (%s…): only act steps that name them use them", profilePrefix)
+			}
 			if len(c.Command) > 0 || len(c.Secrets) > 0 {
 				return bad("command and secrets are for local connectors")
 			}
@@ -108,6 +111,9 @@ func (cs Connectors) Check() error {
 			for k, v := range c.Secrets {
 				if !envName.MatchString(k) || !envName.MatchString(v) {
 					return bad("secrets map container variables to the worker's variables, by name")
+				}
+				if IsProfileName(v) {
+					return bad("secrets can't name one of your details (%s…): only act steps that name them use them", profilePrefix)
 				}
 			}
 			if c.TokenEnv != "" {

@@ -323,9 +323,15 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	// (MaxToolCalls; "No such tool." for anything not offered).
 	var rec AgentResult
 	frame := reed.Frame{}
+	red := newRedactor(secrets) // details hidden from Claude, beats and the record (review 42)
 	beat := func() {
 		if a.OnProgress != nil {
-			a.OnProgress(res, frame)
+			r := res
+			r.Calls = append([]ActCall(nil), res.Calls...) // hidden in a copy
+			r.Blocked, r.Held = append([]string(nil), res.Blocked...), append([]string(nil), res.Held...)
+			red.result(&r)
+			frame.URL = red.text(frame.URL)
+			a.OnProgress(r, frame)
 		}
 	}
 	// It beats while it waits on Claude too, so a slow turn or a retry
@@ -465,12 +471,12 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 				}
 			} else {
 				tc := rec.Tools[len(rec.Tools)-1]
-				call := ActCall{Tool: tc.Tool, Input: tc.Input, Output: tc.Output, IsError: tc.IsError, Truncated: tc.Truncated, URL: currentURL(lctx, cs)}
+				call := ActCall{Tool: tc.Tool, Input: red.text(tc.Input), Output: red.text(tc.Output), IsError: tc.IsError, Truncated: tc.Truncated, URL: red.text(currentURL(lctx, cs))}
 				if call.URL != "" {
 					res.URL = call.URL
 				}
 				if !observes[tc.Tool] {
-					if f, ok := screenshot(lctx, cs, res.URL, len(q.Uses) > 0); ok {
+					if f, ok := screenshot(lctx, cs, res.URL, len(secrets)); ok {
 						frame, call.Shot = f, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(f.JPEG)
 					}
 				}
@@ -480,7 +486,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 			if out == "" {
 				out = "(no output)"
 			}
-			results = append(results, anthropic.NewBetaToolResultBlock(b.ID, out, isErr))
+			results = append(results, anthropic.NewBetaToolResultBlock(b.ID, red.text(out), isErr))
 		}
 		if cancelled {
 			res.Ended = EndedCancelled
@@ -494,6 +500,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	res.Blocked, res.BlockedTotal, res.BlockedUnknown = blockedRequests(ctx, cs, res.Allowed)
 	res.Held, res.HeldTotal = heldSends(ctx, cs)
 	res.Pending = nil
+	red.result(&res)
 	fitAct(&res)
 	return res, nil
 }
@@ -514,7 +521,7 @@ func (a Act) confirm(ctx context.Context, bud *budget, cs *mcp.ClientSession, b 
 	json.Unmarshal(b.Input, &in)
 	summary := clip(strings.TrimSpace(in.Summary), 1024)
 	call := ActCall{Tool: ConfirmTool, Input: clip(string(b.Input), RecordedOutput), URL: currentURL(ctx, cs), IsError: true}
-	if f, ok := screenshot(ctx, cs, call.URL, len(q.Uses) > 0); ok {
+	if f, ok := screenshot(ctx, cs, call.URL, len(q.Uses)); ok {
 		*frame, call.Shot = f, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(f.JPEG)
 	}
 	say := func(s string) (string, int, ActCall) { call.Output = s; res.Text = s; return s, confirmEnd, call }
@@ -1053,13 +1060,13 @@ func stdio(cmd *exec.Cmd) (mcp.Transport, error) {
 
 // screenshot takes a screenshot through Playwright MCP (a tool Claude
 // isn't given) and makes a frame of it. A step that uses the person's
-// details takes it with reed's ShotJS, which masks them (roadmap 9.8):
+// details takes it with reed's ShotJSFor, which masks them (roadmap 9.8):
 // if that fails, there is no frame, never an unmasked one.
-func screenshot(ctx context.Context, cs *mcp.ClientSession, at string, masked bool) (reed.Frame, bool) {
+func screenshot(ctx context.Context, cs *mcp.ClientSession, at string, details int) (reed.Frame, bool) {
 	cctx, cancel := context.WithTimeout(ctx, ActionTimeout)
 	defer cancel()
-	if masked {
-		r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_run_code_unsafe", Arguments: map[string]any{"code": reed.ShotJS}})
+	if details > 0 {
+		r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_run_code_unsafe", Arguments: map[string]any{"code": reed.ShotJSFor(details)}})
 		if err != nil || r.IsError {
 			return reed.Frame{}, false
 		}
