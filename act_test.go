@@ -81,8 +81,17 @@ func fakeBrowser() *mcp.Server {
 			// With $FAKE_RENAME, the page opened has the field renamed
 			// (roadmap 9.9).
 			field := "Name"
-			if os.Getenv("FAKE_RENAME") != "" && navigated {
+			if r := os.Getenv("FAKE_RENAME"); r != "" && navigated {
 				field = "Full name"
+				if r != "1" {
+					field = r // a name of the test's own
+				}
+			}
+			if os.Getenv("FAKE_TWIN") != "" { // two buttons whose names hide alike (review 51)
+				changed += "- button \"Hi Ada Lovelace\" [ref=e10]\n- button \"Hi ⟨name⟩\" [ref=e11]\n"
+			}
+			if os.Getenv("FAKE_PASSWORD") != "" { // the page has a password field, e9
+				changed += "- textbox \"Password\" [ref=e9]\n"
 			}
 			// An element's ref stays as Playwright keeps it; the ref of a
 			// new element (the generic one) differs (roadmap 9.9).

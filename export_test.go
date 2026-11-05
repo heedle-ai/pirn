@@ -20,3 +20,6 @@ func SetStepBeatEvery(every, quiet time.Duration, beat func()) func() {
 	}
 	return func() { stepBeatEvery, beatQuiet, recordHeartbeat = e, q, activity.RecordHeartbeat }
 }
+
+// ReadsOnly are the tools a payment page allows besides leaving it.
+var ReadsOnly = readsOnly
