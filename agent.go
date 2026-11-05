@@ -18,6 +18,7 @@ import (
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"go.temporal.io/sdk/activity"
 
 	"github.com/heedle-ai/bobbin"
 )
@@ -179,6 +180,13 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 	a, err := a.fresh()
 	if err != nil {
 		return AgentResult{}, err
+	}
+	// Every agent step, a skill's creation included, carries its run's
+	// labels (PIRN-500) and heartbeats while it runs (PIRN-502).
+	ctx = stepContext(ctx, "")
+	if activity.IsActivity(ctx) {
+		stop := a.heartbeating(ctx)
+		defer stop()
 	}
 	if a.Claude, err = a.Claude.withKey(ctx); err != nil {
 		return AgentResult{}, err

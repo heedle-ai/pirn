@@ -57,6 +57,7 @@ func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 				"connector.go": {"os", "net/url"},
 				"vault.go":     {"os", "os/exec", "runtime", "sync"},
 				"act.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/url", "os/exec"},
+				"heartbeat.go": {"sync"},
 			}
 			if !allowed[p] && !slices.Contains(except[f], p) {
 				bad = append(bad, f+": "+p)
