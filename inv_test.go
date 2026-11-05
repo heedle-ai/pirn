@@ -56,7 +56,7 @@ func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 				"mcp.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/http", "github.com/anthropics/anthropic-sdk-go/packages/param"},
 				"connector.go": {"os", "net/url"},
 				"vault.go":     {"os", "os/exec", "runtime", "sync"},
-				"act.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/url", "os/exec"},
+				"act.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/url", "os/exec", "crypto/rand", "sync"}, // crypto/rand and sync: a pending send's ID and the paused budget (roadmap 9.7)
 				"heartbeat.go": {"sync"},
 			}
 			if !allowed[p] && !slices.Contains(except[f], p) {
