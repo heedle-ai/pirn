@@ -25,11 +25,16 @@ func stepContext(ctx context.Context, node string) context.Context {
 }
 
 // visitLabels are ctx's run labels as reed's, for an act session's
-// browser.
+// browser, with the worker's home (bobbin.HomeFrom, else the labels';
+// roadmap 9.2.1).
 func visitLabels(ctx context.Context) map[string]string {
 	l := bobbin.LabelsFrom(ctx)
+	home := bobbin.HomeFrom(ctx)
+	if home == "" {
+		home = l.Home
+	}
 	m := map[string]string{}
-	for k, v := range map[string]string{reed.LabelWorkflow: l.Workflow, reed.LabelRun: l.Run, reed.LabelStep: l.Step} {
+	for k, v := range map[string]string{reed.LabelWorkflow: l.Workflow, reed.LabelRun: l.Run, reed.LabelStep: l.Step, reed.LabelHome: home} {
 		if v != "" {
 			m[k] = v
 		}
