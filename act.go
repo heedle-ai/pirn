@@ -12,7 +12,9 @@ package pirn
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -51,12 +54,22 @@ const (
 	// actConnector is how the browser's tools are named to Claude
 	// (browser__browser_click); it is no connector anyone can grant.
 	actConnector = "browser"
+	// ConfirmTimeout is how long a step waits for a person to confirm a
+	// send before it ends with nothing sent; MaxConfirmations bounds the
+	// sends one step may ask for (roadmap 9.7).
+	ConfirmTimeout   = 30 * time.Minute
+	MaxConfirmations = 5
+	// ConfirmTool is the tool Claude calls before the click that sends a
+	// form; SendFreely is the option (:send-without-asking) that lets a
+	// step send without it.
+	ConfirmTool = "confirm"
+	SendFreely  = ":send-without-asking"
 )
 
 // ActOptions are how act steps run: one attempt only, so a form is never
 // submitted twice; an attempt's timeout beyond ActBudget, so the budget
 // ends the step with its record; a heartbeat after every action.
-var ActOptions = plan.Options{Timeout: ActBudget + 5*time.Minute, Heartbeat: 3 * time.Minute, MaxAttempts: 1}
+var ActOptions = plan.Options{Timeout: ActBudget + MaxConfirmations*ConfirmTimeout + 5*time.Minute, Heartbeat: 3 * time.Minute, MaxAttempts: 1}
 
 // Ended says how an act step ended.
 const (
@@ -68,6 +81,9 @@ const (
 	// EndedError: asking Claude failed after the step had acted, so it
 	// stopped, its record kept (review 39: it was thrown away).
 	EndedError = "error"
+	// EndedCancelled: a person cancelled a send, or didn't answer within
+	// ConfirmTimeout, so nothing more was sent (roadmap 9.7).
+	EndedCancelled = "cancelled"
 )
 
 // ActSystem is the system prompt of every act step.
@@ -78,6 +94,11 @@ const ActSystem = `You are one step in a recorded pipeline, working a web browse
 - You can't upload or download files, and the browser starts with no cookies: you can't sign in. If the form needs a sign-in, a file, payment, or anything the inputs don't give, or anything is unclear, stop and say why.
 - Every action is recorded with a screenshot.
 - When you're done, reply with a short summary of what you entered and submitted, citing inputs by name, like n0. End with one line: "Result: finished" if the task is done, or "Result: stopped" if you stopped.`
+
+// ActConfirmRule is added to ActSystem unless the step sends without
+// asking (roadmap 9.7).
+const ActConfirmRule = `
+- The browser sends nothing a form submits until the person confirms. Fill in every field first; then, right before each click that sends a form (Submit, Send, Next on a form page, Pay), call confirm with a one-sentence summary of what will be sent, naming each value. Wait for its answer: if it says to send, make that one click at once; if not, stop and say why. One confirmation sends one form.`
 
 // ActBrowser starts act sessions: ReedBrowser, or a stand-in in tests.
 type ActBrowser interface {
@@ -106,6 +127,29 @@ type Act struct {
 	OnProgress func(ActResult, reed.Frame)
 	// Budget overrides ActBudget when set.
 	Budget time.Duration
+	// Confirm asks a person whether to send the form a pending
+	// confirmation describes, and waits for the answer: true sends it.
+	// While it waits the step's budget stands still. Nil means no one can
+	// be asked here, so a step that must ask sends nothing (roadmap 9.7).
+	Confirm func(context.Context, ActPending) (bool, error)
+	// ConfirmWithin overrides ConfirmTimeout when set.
+	ConfirmWithin time.Duration
+}
+
+// ActPending is a send waiting for a person (roadmap 9.7): its ID (random,
+// so a decision names a send someone saw), Claude's summary of what will
+// be sent, and the page; the live frame shows it.
+type ActPending struct {
+	ID      string `json:"id"`
+	Summary string `json:"summary"`
+	URL     string `json:"url"`
+}
+
+// ActBeat is an act step's heartbeat: its latest frame (a reed.Frame, as
+// browse's are) and the send waiting for a person, if any.
+type ActBeat struct {
+	reed.Frame
+	Pending *ActPending `json:"pending,omitempty"`
 }
 
 // ActQuestion is one act step: the instruction, the start page and further
@@ -115,6 +159,9 @@ type ActQuestion struct {
 	URL         string
 	Allow       []string
 	Sources     []Source
+	// SendFreely: the program let this step send without asking
+	// (:send-without-asking).
+	SendFreely bool
 }
 
 // ActCall is one browser action, as recorded.
@@ -145,6 +192,15 @@ type ActResult struct {
 	BlockedUnknown bool     `json:"blockedUnknown,omitempty"`
 	Inputs         []string `json:"inputs"` // the node IDs it was given
 	Ended          string   `json:"ended"`
+	// Held are the sends the browser held for want of a confirmation, at
+	// most MaxBlockedRequests, and HeldTotal how many (roadmap 9.7).
+	Held      []string `json:"held"`
+	HeldTotal int      `json:"heldTotal"`
+	// SendFreely: the step sent without asking, as its program let it.
+	SendFreely bool `json:"sendWithoutAsking,omitempty"`
+	// Pending is the send waiting for a person while it waits; never in
+	// the output.
+	Pending *ActPending `json:"-"`
 }
 
 // observes are the tools that only read: no screenshot is taken after them.
@@ -181,6 +237,11 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 		return ActResult{}, err
 	}
 	defer s.Close()
+	if q.SendFreely {
+		if err := s.SendWithoutAsking(ctx); err != nil {
+			return ActResult{}, fmt.Errorf("%w: %v", ErrSetup, err)
+		}
+	}
 	sctx, stop := context.WithCancel(ctx)
 	defer stop()
 	tr, err := stdio(s.Command(sctx))
@@ -200,8 +261,13 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 		return ActResult{}, fmt.Errorf("%w: the browser-agent image's Playwright MCP offers %d of the %d tools act uses: is the image the pinned one?", ErrSetup, len(tb.client), len(reed.ActTools))
 	}
 
+	if !q.SendFreely {
+		tb.tools = append(tb.tools, clientToolParam(ConfirmTool,
+			"Ask the person to confirm sending a form, right before the click that sends it. Waits for their answer.",
+			map[string]any{"summary": map[string]any{"type": "string", "description": "One sentence: what will be sent, naming each value."}}, []string{"summary"}))
+	}
 	res := ActResult{Answer: Answer{Pirn: 1, Model: claude.model()}, Act: 1, Image: a.Image,
-		Calls: []ActCall{}, Allowed: s.Allowed(), Blocked: []string{}, Inputs: []string{}}
+		Calls: []ActCall{}, Allowed: s.Allowed(), Blocked: []string{}, Inputs: []string{}, Held: []string{}, SendFreely: q.SendFreely}
 	var inputs strings.Builder
 	for _, src := range q.Sources {
 		res.Inputs = append(res.Inputs, src.ID)
@@ -231,9 +297,16 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	}
 	// It beats while it waits on Claude too, so a slow turn or a retry
 	// isn't taken for a hung step.
-	ag := Agent{Claude: claude, CommandTimeout: ActionTimeout, system: ActSystem, noShell: true, OnProgress: func(AgentResult) { beat() }}
-	lctx, cancel := context.WithTimeout(ctx, a.budget())
-	defer cancel()
+	system := ActSystem
+	if !q.SendFreely {
+		system += ActConfirmRule
+	}
+	ag := Agent{Claude: claude, CommandTimeout: ActionTimeout, system: system, noShell: true, OnProgress: func(AgentResult) { beat() }}
+	// The budget stands still while a person is asked (roadmap 9.7).
+	bud := startBudget(ctx, a.budget())
+	defer bud.stop()
+	lctx := bud.ctx
+	confirms := 0
 	client := claude.client()
 	msgs := []anthropic.BetaMessageParam{anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(prompt))}
 	hitLimit := false
@@ -281,7 +354,11 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 			break
 		}
 		var results []anthropic.BetaContentBlockParamUnion
+		cancelled := false
 		for _, b := range uses {
+			if cancelled { // nothing after a send the person didn't confirm
+				break
+			}
 			before := len(rec.Tools)
 			var out string
 			isErr, redact := true, false
@@ -294,6 +371,18 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 				// Refused calls count too, so a page can't make the record
 				// grow without bound (review 39).
 				out = fmt.Sprintf("Not run: this step reached its limit of %d actions.", MaxToolCalls)
+			case b.Name == ConfirmTool && !q.SendFreely:
+				confirms++
+				var sent bool
+				var call ActCall
+				out, sent, call = a.confirm(ctx, bud, cs, b, confirms, &res, &frame, beat)
+				res.Calls = append(res.Calls, call)
+				results = append(results, anthropic.NewBetaToolResultBlock(b.ID, out, !sent))
+				beat()
+				if !sent {
+					cancelled = true
+				}
+				continue
 			default:
 				if why := refuse(b, res.Allowed); why != "" {
 					out = why
@@ -333,15 +422,159 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 			}
 			results = append(results, anthropic.NewBetaToolResultBlock(b.ID, out, isErr))
 		}
+		if cancelled {
+			res.Ended = EndedCancelled
+			break
+		}
 		msgs = append(msgs, anthropic.NewBetaUserMessage(results...))
 	}
 	if strings.TrimSpace(res.Text) == "" {
 		res.Text = "(Claude ended without a reply.)"
 	}
 	res.Blocked, res.BlockedTotal, res.BlockedUnknown = blockedRequests(ctx, cs, res.Allowed)
+	res.Held, res.HeldTotal = heldSends(ctx, cs)
+	res.Pending = nil
 	fitAct(&res)
 	return res, nil
 }
+
+// confirm asks a person, through a.Confirm, whether to send the form
+// Claude's confirm call describes (roadmap 9.7). While it waits it beats
+// with the pending send and its screenshot, and the budget stands still.
+// A yes opens reed's hold for one send (reed.ReleaseJS); a no, no answer
+// within ConfirmTimeout, no way to ask, or too many sends, ends the step.
+// It returns what Claude is told, whether to send, and the call as
+// recorded.
+func (a Act) confirm(ctx context.Context, bud *budget, cs *mcp.ClientSession, b anthropic.BetaContentBlockUnion, n int, res *ActResult, frame *reed.Frame, beat func()) (string, bool, ActCall) {
+	var in struct {
+		Summary string `json:"summary"`
+	}
+	json.Unmarshal(b.Input, &in)
+	summary := clip(strings.TrimSpace(in.Summary), 1024)
+	call := ActCall{Tool: ConfirmTool, Input: clip(string(b.Input), RecordedOutput), URL: currentURL(ctx, cs), IsError: true}
+	if f, ok := screenshot(ctx, cs, call.URL); ok {
+		*frame, call.Shot = f, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(f.JPEG)
+	}
+	say := func(s string) (string, bool, ActCall) { call.Output = s; res.Text = s; return s, false, call }
+	switch {
+	case summary == "":
+		call.Output = "Not asked: say what will be sent, naming each value."
+		return call.Output, true, call // not a no: Claude may ask again, and nothing was opened
+	case n > MaxConfirmations:
+		return say(fmt.Sprintf("Not sent: this step may ask to send at most %d forms.", MaxConfirmations))
+	case a.Confirm == nil:
+		return say("Not sent: no one can confirm a send here, and this step may not send without asking.")
+	}
+	var id [8]byte
+	rand.Read(id[:])
+	res.Pending = &ActPending{ID: hex.EncodeToString(id[:]), Summary: summary, URL: call.URL}
+	bud.pause()
+	defer bud.resume()
+	beat()
+	within := ConfirmTimeout
+	if a.ConfirmWithin > 0 {
+		within = a.ConfirmWithin
+	}
+	wctx, cancel := context.WithTimeout(ctx, within)
+	defer cancel()
+	done := make(chan struct{})
+	var send bool
+	var err error
+	go func() { send, err = a.Confirm(wctx, *res.Pending); close(done) }()
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+wait:
+	for {
+		select {
+		case <-done:
+			break wait
+		case <-tick.C:
+			beat() // still waiting: not a hung step
+		}
+	}
+	res.Pending = nil
+	switch {
+	case ctx.Err() != nil:
+		return say("Not sent: the step was stopped while it waited.")
+	case err != nil && wctx.Err() != nil:
+		return say(fmt.Sprintf("Not sent: no one confirmed within %s, so nothing was sent.", within))
+	case err != nil:
+		return say("Not sent: the confirmation couldn't be read: " + clip(err.Error(), 512))
+	case !send:
+		return say("Not sent: the person cancelled it, so nothing was sent.")
+	}
+	cctx, ccancel := context.WithTimeout(ctx, ActionTimeout)
+	defer ccancel()
+	r, rerr := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_run_code_unsafe", Arguments: map[string]any{"code": reed.ReleaseJS}})
+	if rerr != nil || r.IsError || !strings.Contains(contentText(r.Content), "released") {
+		return say("Not sent: the person confirmed, but the browser couldn't open the way for it.")
+	}
+	call.Output, call.IsError = "Confirmed: send it now, with one click.", false
+	return call.Output, true, call
+}
+
+// heldSends are the sends reed's hold held (reed.HeldJS), at most
+// MaxBlockedRequests, and how many.
+func heldSends(ctx context.Context, cs *mcp.ClientSession) ([]string, int) {
+	cctx, cancel := context.WithTimeout(ctx, ActionTimeout)
+	defer cancel()
+	out := []string{}
+	r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_run_code_unsafe", Arguments: map[string]any{"code": reed.HeldJS}})
+	if err != nil || r.IsError {
+		return out, 0
+	}
+	var h struct {
+		Held  []string `json:"held"`
+		Total int      `json:"total"`
+	}
+	text := contentText(r.Content)
+	if i := strings.IndexByte(text, '{'); i >= 0 {
+		dec := json.NewDecoder(strings.NewReader(text[i:]))
+		dec.Decode(&h)
+	}
+	for _, x := range h.Held {
+		if len(out) < MaxBlockedRequests {
+			out = append(out, clip(x, reed.MaxBlockedURL))
+		}
+	}
+	return out, h.Total
+}
+
+// budget is a step's time, which stands still while a person is asked.
+type budget struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	left   time.Duration
+	from   time.Time
+	timer  *time.Timer
+}
+
+func startBudget(parent context.Context, d time.Duration) *budget {
+	ctx, cancel := context.WithCancel(parent)
+	b := &budget{ctx: ctx, cancel: cancel, left: d, from: time.Now()}
+	b.timer = time.AfterFunc(d, cancel)
+	return b
+}
+
+func (b *budget) pause() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.timer.Stop() {
+		b.left -= time.Since(b.from)
+	}
+}
+
+func (b *budget) resume() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ctx.Err() == nil {
+		b.from = time.Now()
+		b.timer = time.AfterFunc(max(b.left, 0), b.cancel)
+	}
+}
+
+func (b *budget) stop() { b.timer.Stop(); b.cancel() }
 
 // endedBy reads how Claude ended from its last line.
 func endedBy(text string, hitLimit bool) string {
@@ -533,11 +766,11 @@ func ParseAct(out string) (r ActResult, ok bool) {
 	d := json.NewDecoder(bytes.NewReader([]byte(out)))
 	d.DisallowUnknownFields()
 	if d.Decode(&r) != nil || d.More() || r.Act != 1 || r.Pirn != 1 || r.Model == "" ||
-		r.Calls == nil || r.Allowed == nil || r.Blocked == nil || r.Inputs == nil {
+		r.Calls == nil || r.Allowed == nil || r.Blocked == nil || r.Inputs == nil || r.Held == nil {
 		return ActResult{}, false
 	}
 	switch r.Ended {
-	case EndedFinished, EndedStopped, EndedMaxCalls, EndedMaxTurns, EndedTimeout, EndedError:
+	case EndedFinished, EndedStopped, EndedMaxCalls, EndedMaxTurns, EndedTimeout, EndedError, EndedCancelled:
 	default:
 		return ActResult{}, false
 	}
@@ -576,9 +809,13 @@ func ActCommand(a Act) weft.Arrow[plan.Input, string] {
 			return "", temporal.NewNonRetryableApplicationError("act needs an instruction and a start page", "InvalidInput", nil)
 		}
 		if activity.IsActivity(ctx) {
-			a.OnProgress = func(_ ActResult, f reed.Frame) { activity.RecordHeartbeat(ctx, f) }
+			a.OnProgress = func(r ActResult, f reed.Frame) { activity.RecordHeartbeat(ctx, ActBeat{Frame: f, Pending: r.Pending}) }
 		}
-		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: in.Args[2:], Sources: sources(in.Upstream, pageSource)})
+		hosts, freely, err := actOptions(in.Args[2:])
+		if err != nil {
+			return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
+		}
+		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: hosts, SendFreely: freely, Sources: sources(in.Upstream, pageSource)})
 		var wait *RetryAfter
 		switch {
 		case ctx.Err() != nil && err != nil:
@@ -612,7 +849,11 @@ func ActHosts(args []string) (hosts []string, ok bool) {
 	if len(args) < 2 {
 		return nil, false
 	}
-	h, err := reed.Visit{URL: args[1], Allow: args[2:]}.Allowlist()
+	allow, _, err := actOptions(args[2:])
+	if err != nil {
+		return nil, false
+	}
+	h, err := reed.Visit{URL: args[1], Allow: allow}.Allowlist()
 	if err != nil {
 		return nil, false
 	}
@@ -620,10 +861,39 @@ func ActHosts(args []string) (hosts []string, ok bool) {
 	return h, true
 }
 
+// ActSendsFreely says whether an act step's arguments (after the start
+// page) let it send without asking (roadmap 9.7). ok is false if they
+// aren't valid.
+func ActSendsFreely(args []string) (freely, ok bool) {
+	if len(args) < 2 {
+		return false, false
+	}
+	_, freely, err := actOptions(args[2:])
+	return freely, err == nil
+}
+
+// actOptions splits an act step's arguments after its start page into
+// further hosts and its options: :send-without-asking, at most once. Any
+// other option is an error (a keyword can't be a host).
+func actOptions(args []string) (hosts []string, freely bool, err error) {
+	for _, a := range args {
+		switch {
+		case a == SendFreely && !freely:
+			freely = true
+		case strings.HasPrefix(a, ":"):
+			return nil, false, fmt.Errorf("%w: act has no option %s (it has %s)", ErrInvalid, a, SendFreely)
+		default:
+			hosts = append(hosts, a)
+		}
+	}
+	return hosts, freely, nil
+}
+
 // ActSession is one act step's browser (reed.Session).
 type ActSession interface {
 	Command(ctx context.Context) *exec.Cmd // Playwright MCP, over stdin and stdout
 	Allowed() []string
+	SendWithoutAsking(ctx context.Context) error // lifts the hold on sends (roadmap 9.7)
 	Close()
 }
 
