@@ -284,7 +284,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 		for _, b := range uses {
 			before := len(rec.Tools)
 			var out string
-			isErr := true
+			isErr, redact := true, false
 			switch {
 			case msg.StopReason == "max_tokens":
 				out = "Not run: your reply was cut off at the output limit, so this action may be incomplete. Send it again."
@@ -300,7 +300,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 					break
 				}
 				if typesInto(b) && password(lctx, cs, b) {
-					out = notPassword
+					out, redact = notPassword, true
 					break
 				}
 				out, isErr = ag.call(lctx, tb, b, &rec)
@@ -308,7 +308,11 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 			if len(rec.Tools) == before { // not run: refused or over the limit
 				hitLimit = hitLimit || strings.Contains(out, "limit of")
 				if len(res.Calls) <= MaxToolCalls { // the one past the limit says so; later ones aren't recorded
-					res.Calls = append(res.Calls, ActCall{Tool: strings.TrimPrefix(b.Name, actConnector+"__"), Input: clip(string(b.Input), RecordedOutput), Output: out, IsError: true})
+					in := clip(string(b.Input), RecordedOutput)
+					if redact {
+						in = redacted(b.Input) // what it would have typed isn't kept (review 40)
+					}
+					res.Calls = append(res.Calls, ActCall{Tool: strings.TrimPrefix(b.Name, actConnector+"__"), Input: in, Output: out, IsError: true})
 				}
 			} else {
 				tc := rec.Tools[len(rec.Tools)-1]
@@ -377,8 +381,32 @@ func refuse(b anthropic.BetaContentBlockUnion, allowed []string) string {
 	return "Not run: this step may only open http or https pages on " + strings.Join(allowed, ", ") + "."
 }
 
-// notPassword answers a call that would type into a password field.
-const notPassword = "Not run: that is a password field. An act step never types a password: stop, and say the form asks for one."
+// notPassword answers a call that would type into a password field, or
+// type keys that move to another field.
+const notPassword = "Not run: that is, or may be, a password field, or the text would move to another field. An act step never types a password: if the form asks for one, stop and say so; otherwise type into one field at a time."
+
+// redacted is a refused typing call's input with what it would have typed
+// replaced: the text and every field's value.
+func redacted(input []byte) string {
+	var in map[string]any
+	if json.Unmarshal(input, &in) != nil {
+		return "{}"
+	}
+	for _, k := range []string{"text", "value", "key"} {
+		if _, ok := in[k]; ok {
+			in[k] = "(not recorded)"
+		}
+	}
+	if fs, ok := in["fields"].([]any); ok {
+		for _, f := range fs {
+			if m, ok := f.(map[string]any); ok {
+				m["value"] = "(not recorded)"
+			}
+		}
+	}
+	b, _ := json.Marshal(in)
+	return string(b)
+}
 
 // typesInto says whether b types into the page: the calls password
 // checks before they run.
@@ -390,12 +418,29 @@ func typesInto(b anthropic.BetaContentBlockUnion) bool {
 	return false
 }
 
-// isPassword is the browser's answer to whether an element, or the
-// focused one (following focus into frames), is a password field.
+// isPassword and focusedIsPassword ask the browser whether an element,
+// or the focused one, is a password field: "no" only when it surely
+// isn't. The element is the one Playwright would type into (a label's
+// control, as Playwright retargets fill and type); focus is followed into
+// shadow roots and same-origin frames, and a cross-origin frame's focus,
+// which can't be seen, isn't "no" (review 40).
 const (
-	isPassword        = `(el) => el instanceof HTMLInputElement && el.type === "password"`
-	focusedIsPassword = `() => { let a = document.activeElement; while (a && a.contentDocument) a = a.contentDocument.activeElement; return !!a && a instanceof a.ownerDocument.defaultView.HTMLInputElement && a.type === "password"; }`
+	isPassword        = `(el) => { let e = el; if (!(e.tagName === "INPUT" || e.tagName === "TEXTAREA" || e.isContentEditable)) { const l = e.closest && e.closest("label"); if (l && l.control) e = l.control; } return e.tagName === "INPUT" && String(e.type).toLowerCase() === "password" ? "yes" : "no"; }`
+	focusedIsPassword = `() => { let a = document.activeElement; for (;;) { if (a && a.shadowRoot && a.shadowRoot.activeElement) { a = a.shadowRoot.activeElement; continue; } if (a && (a.tagName === "IFRAME" || a.tagName === "FRAME")) { if (!a.contentDocument) return "unknown"; a = a.contentDocument.activeElement; continue; } break; } return a && a.tagName === "INPUT" && String(a.type).toLowerCase() === "password" ? "yes" : "no"; }`
 )
+
+// movesFocus says whether text typed key by key would move focus or send
+// the form: a Tab, a newline or a carriage return (review 40: "a\tb"
+// typed slowly fills the next field, unchecked).
+func movesFocus(b anthropic.BetaContentBlockUnion) bool {
+	var in struct {
+		Text   string `json:"text"`
+		Slowly bool   `json:"slowly"`
+		Key    string `json:"key"`
+	}
+	json.Unmarshal(b.Input, &in)
+	return strings.ContainsAny(in.Text, "\t\r") || (in.Slowly && strings.ContainsAny(in.Text, "\n"))
+}
 
 // password says whether b would type into a password field (roadmap 9.6:
 // a form that asks for a password is refused, never filled), asking the
@@ -415,7 +460,12 @@ func password(ctx context.Context, cs *mcp.ClientSession, b anthropic.BetaConten
 		cctx, cancel := context.WithTimeout(ctx, ActionTimeout)
 		defer cancel()
 		r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_evaluate", Arguments: args})
-		return err == nil && !r.IsError && strings.HasPrefix(contentText(r.Content), "### Result\ntrue\n")
+		// Anything but a plain "no" is a password field: an error, a
+		// timeout or a page that can't say is refused (review 40).
+		return err != nil || r.IsError || !strings.HasPrefix(contentText(r.Content), "### Result\n\"no\"\n")
+	}
+	if movesFocus(b) {
+		return true
 	}
 	if strings.HasSuffix(b.Name, "browser_press_key") {
 		return ask(map[string]any{"function": focusedIsPassword})
