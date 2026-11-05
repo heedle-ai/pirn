@@ -3,6 +3,7 @@ package pirn_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -103,8 +104,13 @@ func fakeBrowser() *mcp.Server {
 	// act opens reed's hold and reads what it held (roadmap 9.7); Claude
 	// never gets this tool.
 	mcp.AddTool(s, &mcp.Tool{Name: "browser_run_code_unsafe"}, func(_ context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
-		log("browser_run_code_unsafe", map[string]any{"code": map[any]string{reed.ReleaseJS: "release", reed.CloseJS: "close", reed.HeldJS: "held"}[in["code"]]})
+		log("browser_run_code_unsafe", map[string]any{"code": map[any]string{reed.ReleaseJS: "release", reed.CloseJS: "close", reed.HeldJS: "held", reed.ShotJS: "shot"}[in["code"]]})
 		switch in["code"] {
+		case reed.ShotJS:
+			var b bytes.Buffer
+			png.Encode(&b, image.NewRGBA(image.Rect(0, 0, reed.Width, reed.Height)))
+			q, _ := json.Marshal(base64.StdEncoding.EncodeToString(b.Bytes()))
+			return text("### Result\n" + string(q) + "\n"), nil, nil
 		case reed.ReleaseJS:
 			return text("### Result\n\"released\"\n"), nil, nil
 		case reed.CloseJS:
@@ -139,6 +145,7 @@ func fakeBrowser() *mcp.Server {
 
 // fakeActBrowser starts sessions that run fakeBrowser over stdio.
 type fakeActBrowser struct {
+	last  *fakeSession
 	calls string // the file each call is logged to
 	got   reed.Visit
 	err   error
@@ -158,7 +165,8 @@ func (f *fakeActBrowser) Start(_ context.Context, v reed.Visit) (pirn.ActSession
 	if env == "" {
 		env = "browser"
 	}
-	return &fakeSession{allowed: allowed, calls: f.calls, env: env}, nil
+	f.last = &fakeSession{allowed: allowed, calls: f.calls, env: env}
+	return f.last, nil
 }
 
 type fakeSession struct {
@@ -167,6 +175,15 @@ type fakeSession struct {
 	env     string
 	closed  bool
 	freely  bool
+	secrets map[string]string
+}
+
+func (s *fakeSession) UseProfile(_ context.Context, secrets map[string]string) error {
+	s.secrets = secrets
+	f, _ := os.OpenFile(s.calls, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	fmt.Fprintln(f, "use-profile {}")
+	f.Close()
+	return nil
 }
 
 func (s *fakeSession) SendWithoutAsking(context.Context) error {
@@ -923,5 +940,121 @@ func TestInv_ActSendsWithoutAskingOnlyWhenTold(t *testing.T) {
 func TestInv_ActStepsEndBeforeTheirBrowser(t *testing.T) {
 	if pirn.ActOptions.Timeout >= reed.SessionTimeout {
 		t.Errorf("an act step may last %v, its browser %v", pirn.ActOptions.Timeout, reed.SessionTimeout)
+	}
+}
+
+// TestInv_ActUsesOnlyGrantedDetails: an act step uses only the details its
+// program names (:uses): only those are looked up, before the browser
+// starts; the browser gets each under its placeholder; Claude is told the
+// placeholders and never a value, and the record names the details, never
+// their values; every frame is taken masked (reed's ShotJS). A detail
+// that isn't set, or a worker that can't read details, stops the step
+// before the browser starts. (Roadmap 9.8.)
+func TestInv_ActUsesOnlyGrantedDetails(t *testing.T) {
+	profile := map[string]string{"name": "Ada Lovelace", "email": "ada@example.org", "phone": "020 7946 0018", "address": "12 St James's Square, London", "birthdate": "1815-12-10"}
+	var looked []string
+	lookup := func(_ context.Context, f string) (string, bool, error) {
+		looked = append(looked, f)
+		v, ok := profile[f]
+		return v, ok, nil
+	}
+	fill := browserUse("t1", "browser_fill_form", `{"fields":[{"name":"Name","type":"textbox","target":"e5","value":"⟨name⟩"}]}`)
+	api := newActAPI(t, actTurn("tool_use", fill), actTurn("end_turn", `{"type":"text","text":"Filled.\nResult: finished"}`))
+	a, b := newAct(t, api)
+	a.Profile = lookup
+	res, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "Fill in my name.", URL: "https://forms.example.org/", Uses: []string{"name", "email"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(looked, " ") != "name email" || len(b.last.secrets) != 2 || b.last.secrets["⟨name⟩"] != "Ada Lovelace" || b.last.secrets["⟨email⟩"] != "ada@example.org" {
+		t.Errorf("looked up %v, gave the browser %v", looked, b.last.secrets)
+	}
+	out := string(must(json.Marshal(res)))
+	sent, _ := json.Marshal(api.reqs)
+	for _, v := range profile {
+		if strings.Contains(out, v) || strings.Contains(string(sent), v) {
+			t.Errorf("%q in the record or Claude's prompts", v)
+		}
+	}
+	sys, _ := json.Marshal(api.reqs[0]["system"])
+	if !strings.Contains(string(sys), "⟨name⟩: their name") || !strings.Contains(string(sys), "⟨email⟩") || strings.Contains(string(sys), "⟨phone⟩") {
+		t.Errorf("told: %s", sys)
+	}
+	if strings.Join(res.Uses, " ") != "name email" || !strings.Contains(out, `"uses":["name","email"]`) || !strings.Contains(res.Calls[0].Input, "⟨name⟩") {
+		t.Errorf("record: %s", out)
+	}
+	if c := codes(t, b); !strings.HasPrefix(c, "use-profile ") || !strings.Contains(c, "shot") || strings.Contains(c, "browser_take_screenshot") || res.Calls[0].Shot == "" {
+		t.Errorf("frames weren't masked: %s", c)
+	}
+	// Not set, or no way to read details: nothing starts.
+	for name, p := range map[string]func(context.Context, string) (string, bool, error){
+		"not set":  func(context.Context, string) (string, bool, error) { return "", false, nil },
+		"no vault": nil,
+	} {
+		a, b := newAct(t, newActAPI(t, actTurn("end_turn", `{"type":"text","text":"x"}`)))
+		a.Profile = p
+		_, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/", Uses: []string{"phone"}})
+		if !errors.Is(err, pirn.ErrSetup) || !strings.Contains(err.Error(), "phone number") || b.got.URL != "" {
+			t.Errorf("%s: %v, browser %v", name, err, b.got)
+		}
+	}
+	// The option.
+	if u, ok := pirn.ActUses([]string{"x", "https://forms.example.org/", "cdn.example.org", pirn.Uses, "name email", pirn.SendFreely}); !ok || strings.Join(u, " ") != "name email" {
+		t.Errorf("uses %v %v", u, ok)
+	}
+	if h, ok := pirn.ActHosts([]string{"x", "https://forms.example.org/", pirn.Uses, "name"}); !ok || strings.Join(h, " ") != "forms.example.org" {
+		t.Errorf("a detail read as a host: %v %v", h, ok)
+	}
+	for _, bad := range [][]string{{pirn.Uses}, {pirn.Uses, "ssn"}, {pirn.Uses, "name name"}, {pirn.Uses, ""}, {pirn.Uses, "name", pirn.Uses, "email"}} {
+		if _, ok := pirn.ActUses(append([]string{"x", "https://forms.example.org/"}, bad...)); ok {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+// memVault is a keychain in memory.
+type memVault map[string]string
+
+func (m memVault) Lookup(_ context.Context, n string) (string, bool, error) {
+	v, ok := m[n]
+	return v, ok, nil
+}
+func (m memVault) Store(_ context.Context, n, v string) error {
+	if err := pirn.CheckSecret(n, v); err != nil {
+		return err
+	}
+	m[n] = v
+	return nil
+}
+func (m memVault) Delete(_ context.Context, n string) error { delete(m, n); return nil }
+
+// TestInv_DetailsAreKeptInTheKeychain: a detail is kept in the vault as a
+// value the keychain takes (spaces and any script included), read back
+// exactly, and forgotten; one that isn't one line of text, or isn't a
+// detail, is refused. (Roadmap 9.8.)
+func TestInv_DetailsAreKeptInTheKeychain(t *testing.T) {
+	v := memVault{}
+	ctx := context.Background()
+	for f, val := range map[string]string{"name": "Ada Lovelace", "address": "12 St James's Square, London \"SW1\"", "phone": "+44 20 7946 0018", "birthdate": "10 décembre 1815"} {
+		if err := pirn.StoreProfile(ctx, v, f, val); err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		if got, ok, err := pirn.LookupProfile(ctx, v, f); got != val || !ok || err != nil {
+			t.Errorf("%s: %q %v %v", f, got, ok, err)
+		}
+		if strings.Contains(v[pirn.ProfileKey(f)], " ") {
+			t.Errorf("kept as given: %q", v[pirn.ProfileKey(f)])
+		}
+	}
+	if err := pirn.DeleteProfile(ctx, v, "name"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := pirn.LookupProfile(ctx, v, "name"); ok {
+		t.Error("not forgotten")
+	}
+	for f, val := range map[string]string{"name": "Ada\nLovelace", "email": " ", "ssn": "1", "phone": strings.Repeat("1", pirn.MaxProfileValue+1)} {
+		if err := pirn.StoreProfile(ctx, v, f, val); !errors.Is(err, pirn.ErrInvalid) {
+			t.Errorf("%s %q: %v", f, val, err)
+		}
 	}
 }
