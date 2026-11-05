@@ -65,6 +65,9 @@ const (
 	EndedMaxCalls = "max_calls" // it reached MaxToolCalls
 	EndedMaxTurns = "max_turns" // it reached MaxTurns
 	EndedTimeout  = "timeout"   // it reached ActBudget
+	// EndedError: asking Claude failed after the step had acted, so it
+	// stopped, its record kept (review 39: it was thrown away).
+	EndedError = "error"
 )
 
 // ActSystem is the system prompt of every act step.
@@ -137,8 +140,11 @@ type ActResult struct {
 	Allowed      []string  `json:"allowed"`
 	Blocked      []string  `json:"blocked"` // requests to other hosts, refused
 	BlockedTotal int       `json:"blockedTotal"`
-	Inputs       []string  `json:"inputs"` // the node IDs it was given
-	Ended        string    `json:"ended"`
+	// BlockedUnknown: the browser couldn't say which requests it blocked,
+	// so Blocked and BlockedTotal are not to be read as none (review 39).
+	BlockedUnknown bool     `json:"blockedUnknown,omitempty"`
+	Inputs         []string `json:"inputs"` // the node IDs it was given
+	Ended          string   `json:"ended"`
 }
 
 // observes are the tools that only read: no screenshot is taken after them.
@@ -241,6 +247,13 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 				res.Text = fmt.Sprintf("Stopped: this step's time (%s) ran out before Claude finished.", a.budget())
 				break
 			}
+			if len(res.Calls) > 0 && ctx.Err() == nil {
+				// It has acted: a form may be submitted. It isn't retried
+				// (ActOptions), so the record of what it did is the output.
+				res.Ended, res.StopReason = EndedError, "error"
+				res.Text = clip("Stopped: asking Claude failed after this step had acted, so it may have changed something: "+err.Error(), RecordedOutput)
+				break
+			}
 			return res, err
 		}
 		res.Model, res.StopReason = string(msg.Model), string(msg.StopReason)
@@ -257,7 +270,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 				uses = append(uses, b)
 			}
 		}
-		res.Text = text.String()
+		res.Text = clip(text.String(), RecordedOutput)
 		if len(uses) == 0 {
 			res.Ended = endedBy(res.Text, hitLimit)
 			break
@@ -277,15 +290,25 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 				out = "Not run: your reply was cut off at the output limit, so this action may be incomplete. Send it again."
 			case lctx.Err() != nil:
 				out = "Not run: this step's time is up."
+			case len(res.Calls) >= MaxToolCalls:
+				// Refused calls count too, so a page can't make the record
+				// grow without bound (review 39).
+				out = fmt.Sprintf("Not run: this step reached its limit of %d actions.", MaxToolCalls)
 			default:
+				if why := refuse(b, res.Allowed); why != "" {
+					out = why
+					break
+				}
 				out, isErr = ag.call(lctx, tb, b, &rec)
 			}
 			if len(rec.Tools) == before { // not run: refused or over the limit
 				hitLimit = hitLimit || strings.Contains(out, "limit of")
-				res.Calls = append(res.Calls, ActCall{Tool: strings.TrimPrefix(b.Name, actConnector+"__"), Input: clip(string(b.Input), RecordedOutput), Output: out, IsError: true})
+				if len(res.Calls) <= MaxToolCalls { // the one past the limit says so; later ones aren't recorded
+					res.Calls = append(res.Calls, ActCall{Tool: strings.TrimPrefix(b.Name, actConnector+"__"), Input: clip(string(b.Input), RecordedOutput), Output: out, IsError: true})
+				}
 			} else {
 				tc := rec.Tools[len(rec.Tools)-1]
-				call := ActCall{Tool: tc.Tool, Input: tc.Input, Output: tc.Output, IsError: tc.IsError, Truncated: tc.Truncated, URL: pageURL(tc.Output)}
+				call := ActCall{Tool: tc.Tool, Input: tc.Input, Output: tc.Output, IsError: tc.IsError, Truncated: tc.Truncated, URL: currentURL(lctx, cs)}
 				if call.URL != "" {
 					res.URL = call.URL
 				}
@@ -307,7 +330,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	if strings.TrimSpace(res.Text) == "" {
 		res.Text = "(Claude ended without a reply.)"
 	}
-	res.Blocked, res.BlockedTotal = blockedRequests(ctx, cs, res.Allowed)
+	res.Blocked, res.BlockedTotal, res.BlockedUnknown = blockedRequests(ctx, cs, res.Allowed)
 	fitAct(&res)
 	return res, nil
 }
@@ -326,19 +349,55 @@ func endedBy(text string, hitLimit bool) string {
 	}
 }
 
-var pageLine = regexp.MustCompile(`(?m)^- Page URL: (\S+)\s*$`)
+// refuse says why a call mustn't reach the browser, or "": a page may
+// only be opened over http or https on an allowed host (review 39: a
+// data: or javascript: URL would run a script Claude wrote, the very
+// thing act keeps from it). Chromium's switches still bound everything
+// else a page loads.
+func refuse(b anthropic.BetaContentBlockUnion, allowed []string) string {
+	if b.Name != actConnector+"__browser_navigate" {
+		return ""
+	}
+	var in struct {
+		URL string `json:"url"`
+	}
+	json.Unmarshal(b.Input, &in)
+	u, err := url.Parse(strings.TrimSpace(in.URL))
+	if err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.User == nil {
+		for _, h := range allowed {
+			if strings.EqualFold(u.Hostname(), h) {
+				return ""
+			}
+		}
+	}
+	return "Not run: this step may only open http or https pages on " + strings.Join(allowed, ", ") + "."
+}
 
-// pageURL is the page a tool's output says the browser is on, if any.
-func pageURL(out string) string {
-	m := pageLine.FindAllStringSubmatch(out, -1)
+// currentTab is Playwright MCP's line for the current tab in its tab
+// list: "- 0: (current) [title](url)", perhaps with notes after. A title
+// has no line breaks (the DOM collapses them), so the URL is the last
+// bracketed part; one with brackets of its own reads as unknown.
+var currentTab = regexp.MustCompile(`(?m)^- \d+: \(current\) .*\]\(([^()\s]+)\)(?: \[[^\]\n]*\])*$`)
+
+// currentURL is the page the browser is on, from its tab list (a tool
+// Claude isn't given), or "" if it can't say. Never from a tool's output,
+// which a page can write lines into (review 39).
+func currentURL(ctx context.Context, cs *mcp.ClientSession) string {
+	cctx, cancel := context.WithTimeout(ctx, ActionTimeout)
+	defer cancel()
+	r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_tabs", Arguments: map[string]any{"action": "list"}})
+	if err != nil || r.IsError {
+		return ""
+	}
+	m := currentTab.FindStringSubmatch(contentText(r.Content))
 	if m == nil {
 		return ""
 	}
-	return clip(m[len(m)-1][1], reed.MaxURL)
+	return clip(m[1], reed.MaxURL)
 }
 
 // fitAct keeps a result within MaxResult: the oldest screenshots go first,
-// then calls' outputs are cut.
+// then calls' outputs, then their inputs, are cut.
 func fitAct(res *ActResult) {
 	size := func() int { b, _ := json.Marshal(res); return len(b) }
 	for i := 0; i < len(res.Calls) && size() > MaxResult; i++ {
@@ -349,7 +408,14 @@ func fitAct(res *ActResult) {
 			res.Calls[i].Output, res.Calls[i].Truncated = clip(res.Calls[i].Output, 256), true
 		}
 	}
+	for i := 0; i < len(res.Calls) && size() > MaxResult; i++ {
+		if len(res.Calls[i].Input) > 256 {
+			res.Calls[i].Input, res.Calls[i].Truncated = clip(res.Calls[i].Input, 256), true
+		}
+	}
 }
+
+var jpegData = regexp.MustCompile(`^data:image/jpeg;base64,[A-Za-z0-9+/]+={0,2}$`)
 
 // ParseAct reads an act output back, strictly: every field known and of
 // its type, format 1, a model, a known ending, and screenshots that are
@@ -357,16 +423,18 @@ func fitAct(res *ActResult) {
 func ParseAct(out string) (r ActResult, ok bool) {
 	d := json.NewDecoder(bytes.NewReader([]byte(out)))
 	d.DisallowUnknownFields()
-	if d.Decode(&r) != nil || d.More() || r.Act != 1 || r.Pirn != 1 || r.Model == "" {
+	if d.Decode(&r) != nil || d.More() || r.Act != 1 || r.Pirn != 1 || r.Model == "" ||
+		r.Calls == nil || r.Allowed == nil || r.Blocked == nil || r.Inputs == nil {
 		return ActResult{}, false
 	}
 	switch r.Ended {
-	case EndedFinished, EndedStopped, EndedMaxCalls, EndedMaxTurns, EndedTimeout:
+	case EndedFinished, EndedStopped, EndedMaxCalls, EndedMaxTurns, EndedTimeout, EndedError:
 	default:
 		return ActResult{}, false
 	}
 	for _, c := range r.Calls {
-		if c.Shot != "" && !strings.HasPrefix(c.Shot, "data:image/jpeg;base64,") {
+		// As drawdown reads it (review 39: the two disagreed).
+		if c.Shot != "" && !jpegData.MatchString(c.Shot) {
 			return ActResult{}, false
 		}
 	}
@@ -490,16 +558,17 @@ func screenshot(ctx context.Context, cs *mcp.ClientSession, at string) (reed.Fra
 var failedLine = regexp.MustCompile(`(?m)^\d+\. \[[A-Z]+\] (\S+) => \[FAILED\]`)
 
 // blockedRequests are the session's failed requests to hosts outside the
-// allowlist, as Playwright MCP lists them (a tool Claude isn't given): at
-// most MaxBlockedRequests, each cut to reed.MaxBlockedURL, and how many
-// there were.
-func blockedRequests(ctx context.Context, cs *mcp.ClientSession, allowed []string) ([]string, int) {
+// allowlist, as Playwright MCP lists them (a tool Claude isn't given; all
+// of the session's, not only the last page's): at most
+// MaxBlockedRequests, each cut to reed.MaxBlockedURL, and how many there
+// were; unknown when the browser couldn't say.
+func blockedRequests(ctx context.Context, cs *mcp.ClientSession, allowed []string) ([]string, int, bool) {
 	cctx, cancel := context.WithTimeout(ctx, ActionTimeout)
 	defer cancel()
 	out := []string{}
 	r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_network_requests", Arguments: map[string]any{"all": true}})
 	if err != nil || r.IsError {
-		return out, 0
+		return out, 0, true
 	}
 	ok := map[string]bool{}
 	for _, h := range allowed {
@@ -516,5 +585,5 @@ func blockedRequests(ctx context.Context, cs *mcp.ClientSession, allowed []strin
 			out = append(out, clip(m[1], reed.MaxBlockedURL))
 		}
 	}
-	return out, total
+	return out, total, false
 }
