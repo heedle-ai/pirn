@@ -200,6 +200,16 @@ func (r redactor) result(res *ActResult) {
 	for i := range res.Blocked {
 		res.Blocked[i] = r.text(res.Blocked[i])
 	}
+	for i := range res.Script {
+		st := &res.Script[i]
+		st.Input, st.Outline = r.text(st.Input), r.text(st.Outline)
+		for j := range st.Targets {
+			st.Targets[j].Name = r.text(st.Targets[j].Name)
+		}
+	}
+	if res.Replay != nil {
+		res.Replay.Why = r.text(res.Replay.Why)
+	}
 	for i := range res.Held {
 		res.Held[i] = r.text(res.Held[i])
 	}
