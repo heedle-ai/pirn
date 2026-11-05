@@ -134,6 +134,10 @@ type Act struct {
 	Confirm func(context.Context, ActPending) (bool, error)
 	// ConfirmWithin overrides ConfirmTimeout when set.
 	ConfirmWithin time.Duration
+	// Script finds the script an earlier run of the same program kept for
+	// the step at node (roadmap 9.9): loom's Scripts, the last successful
+	// run of the program. Nil, or nothing found, means Claude does it all.
+	Script func(ctx context.Context, node string) (ActScript, bool, error)
 	// Profile looks up one of the person's details (ProfileFrom): only
 	// those a step's program names are ever looked up (roadmap 9.8). Nil
 	// means none can be used here.
@@ -170,6 +174,8 @@ type ActQuestion struct {
 	SendFreely bool
 	// Uses are the person's details the program lets it use (:uses).
 	Uses []string
+	// NoReplay: the program said :replay "off", so Claude does it all.
+	NoReplay bool
 }
 
 // ActCall is one browser action, as recorded.
@@ -184,6 +190,9 @@ type ActCall struct {
 	// Outline is, for a confirm call, the page the person was shown (never
 	// recorded): a yes lets only an action on that same page send.
 	Outline string `json:"-"`
+	// Replayed: a replay did it, from an earlier run's script, not Claude
+	// (roadmap 9.9).
+	Replayed bool `json:"replayed,omitempty"`
 }
 
 // ActResult is an act step's output: an Answer (Claude's final reply, so
@@ -214,6 +223,12 @@ type ActResult struct {
 	// Pending is the send waiting for a person while it waits; never in
 	// the output.
 	Pending *ActPending `json:"-"`
+	// Script is what it did, for the next run of its program to replay
+	// (roadmap 9.9), and ScriptInputs the question it is good for
+	// (InputsSHA). Replay is what this step replayed, if it found a script.
+	Script       []ScriptStep `json:"script,omitempty"`
+	ScriptInputs string       `json:"scriptInputs,omitempty"`
+	Replay       *ActReplay   `json:"replay,omitempty"`
 }
 
 // observes are the tools that only read: no screenshot is taken after them.
@@ -300,7 +315,8 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 			map[string]any{"summary": map[string]any{"type": "string", "description": "One sentence: what will be sent, naming each value."}}, []string{"summary"}))
 	}
 	res := ActResult{Answer: Answer{Pirn: 1, Model: claude.model()}, Act: 1, Image: a.Image,
-		Calls: []ActCall{}, Allowed: s.Allowed(), Blocked: []string{}, Inputs: []string{}, Held: []string{}, SendFreely: q.SendFreely, Uses: q.Uses}
+		Calls: []ActCall{}, Allowed: s.Allowed(), Blocked: []string{}, Inputs: []string{}, Held: []string{}, SendFreely: q.SendFreely, Uses: q.Uses,
+		Script: []ScriptStep{}, ScriptInputs: InputsSHA(q)}
 	var inputs strings.Builder
 	for _, src := range q.Sources {
 		res.Inputs = append(res.Inputs, src.ID)
@@ -353,10 +369,144 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	// the next action may send, and only if it clicks or presses a key on
 	// that same page (review 41).
 	var armed *string
+	hitLimit := false
+	// scriptable says whether every action so far is in the script: one
+	// whose element couldn't be named by role and name ends it.
+	scriptable := true
+
+	// do runs one action, whoever chose it: Claude, or a replay of an
+	// earlier run's script (roadmap 9.9), through the same checks (the
+	// allowlist, the password check, the hold and every confirmation) and
+	// recorded the same way. pre is the page's snapshot just before it, if
+	// the caller has one. It returns what the action answered, whether
+	// that is an error, and, for a confirm call, its outcome.
+	do := func(b anthropic.BetaContentBlockUnion, msgStop string, replayed bool, pre string) (out string, isErr bool, outcome int) {
+		before := len(rec.Tools)
+		isErr, outcome = true, confirmAgain
+		redact := false
+		var step ScriptStep
+		stepOK := false
+		switch {
+		case msgStop == "max_tokens":
+			out = "Not run: your reply was cut off at the output limit, so this action may be incomplete. Send it again."
+		case lctx.Err() != nil:
+			out = "Not run: this step's time is up."
+		case len(res.Calls) >= MaxToolCalls:
+			// Refused calls count too, so a page can't make the record
+			// grow without bound (review 39).
+			out = fmt.Sprintf("Not run: this step reached its limit of %d actions.", MaxToolCalls)
+		case b.Name == ConfirmTool && !q.SendFreely:
+			armed = nil
+			var call ActCall
+			out, outcome, call = a.confirm(ctx, bud, cs, b, &confirms, q, &res, &frame, beat)
+			call.Replayed = replayed
+			res.Calls = append(res.Calls, call)
+			if outcome == confirmYes {
+				armed = &call.Outline
+				if scriptable {
+					o := red.text(call.Outline)
+					j, _ := json.Marshal(map[string]string{"summary": confirmSummary(b)})
+					res.Script = append(res.Script, ScriptStep{Tool: ConfirmTool, Input: red.text(string(j)),
+						Outline: clip(o, MaxOutline), OutlineSHA: sha(o), Replayed: replayed})
+				}
+			}
+			beat()
+			return out, outcome != confirmYes, outcome
+		default:
+			if why := refuse(b, res.Allowed); why != "" {
+				out = why
+				break
+			}
+			if typesInto(b) && password(lctx, cs, b) {
+				out, redact = notPassword, true
+				break
+			}
+			name := strings.TrimPrefix(b.Name, actConnector+"__")
+			if _, offered := tb.client[b.Name]; offered && !observes[name] {
+				// The page as it is just before the action: the script's
+				// expected outline and how its elements are named.
+				if pre == "" {
+					pre, _ = snapshotOf(lctx, cs)
+				}
+				step, stepOK = scriptStep(b, pre, red)
+			}
+			if armed != nil {
+				outline := *armed
+				armed = nil // one action, whatever comes of it
+				switch {
+				case name != "browser_click" && name != "browser_press_key":
+					out = "Not run: after a confirmation, the next action must be the click or key press that sends the form. The confirmation is cancelled: call confirm again when the form is ready."
+				case pre == "" || outlineOf(pre) != outline:
+					out = "Not run: the page changed since the person confirmed it. The confirmation is cancelled: call confirm again, saying what will be sent now."
+				case !runHold(lctx, cs, reed.ReleaseJS, "released"):
+					out = "Not run: the browser couldn't open the way for this send."
+				default:
+					out, isErr = ag.call(lctx, tb, b, &rec)
+					runHold(context.WithoutCancel(lctx), cs, reed.CloseJS, "closed") // the way closes after the one action
+				}
+				break
+			}
+			out, isErr = ag.call(lctx, tb, b, &rec)
+		}
+		if len(rec.Tools) == before { // not run: refused or over the limit
+			hitLimit = hitLimit || strings.Contains(out, "limit of")
+			if len(res.Calls) <= MaxToolCalls { // the one past the limit says so; later ones aren't recorded
+				in := clip(string(b.Input), RecordedOutput)
+				if redact {
+					in = redacted(b.Input) // what it would have typed isn't kept (review 40)
+				}
+				res.Calls = append(res.Calls, ActCall{Tool: strings.TrimPrefix(b.Name, actConnector+"__"), Input: in, Output: out, IsError: true, Replayed: replayed})
+			}
+		} else {
+			tc := rec.Tools[len(rec.Tools)-1]
+			call := ActCall{Tool: tc.Tool, Input: red.text(tc.Input), Output: red.text(tc.Output), IsError: tc.IsError, Truncated: tc.Truncated, URL: red.text(currentURL(lctx, cs)), Replayed: replayed}
+			if call.URL != "" {
+				res.URL = call.URL
+			}
+			if !observes[tc.Tool] {
+				if f, ok := screenshot(lctx, cs, res.URL, len(secrets)); ok {
+					frame, call.Shot = f, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(f.JPEG)
+				}
+				// An action that ran is in the script; one whose elements
+				// couldn't be named ends it there (roadmap 9.9).
+				if !tc.IsError && scriptable {
+					if stepOK {
+						step.Replayed = replayed
+						res.Script = append(res.Script, step)
+					} else {
+						// A script with a gap would replay as if it were
+						// all of it: none is kept.
+						scriptable, res.Script = false, []ScriptStep{}
+					}
+				}
+			}
+			res.Calls = append(res.Calls, call)
+		}
+		beat()
+		if out == "" {
+			out = "(no output)"
+		}
+		return red.text(out), isErr, outcome
+	}
+
+	// Replay first (roadmap 9.9): the script the last successful run of
+	// this program kept for this step, if its question was the same, page
+	// by page; the first page that differs hands the rest to Claude.
+	handover := ""
+	done := false // the replay did the whole script: Claude isn't asked
+	if a.Script != nil && !q.NoReplay {
+		handover, done = a.replay(ctx, lctx, cs, q, &res, red, do)
+	}
+	if done {
+		res.Turns = 0
+	}
+	if handover != "" {
+		prompt += "\n" + handover
+	}
+
 	client := claude.client()
 	msgs := []anthropic.BetaMessageParam{anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(prompt))}
-	hitLimit := false
-	for turn := 1; ; turn++ {
+	for turn := 1; !done; turn++ {
 		res.Turns = turn
 		beat()
 		msg, err := ag.ask(lctx, client, tb, msgs, &rec)
@@ -405,88 +555,9 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 			if cancelled { // nothing after a send the person didn't confirm
 				break
 			}
-			before := len(rec.Tools)
-			var out string
-			isErr, redact := true, false
-			switch {
-			case msg.StopReason == "max_tokens":
-				out = "Not run: your reply was cut off at the output limit, so this action may be incomplete. Send it again."
-			case lctx.Err() != nil:
-				out = "Not run: this step's time is up."
-			case len(res.Calls) >= MaxToolCalls:
-				// Refused calls count too, so a page can't make the record
-				// grow without bound (review 39).
-				out = fmt.Sprintf("Not run: this step reached its limit of %d actions.", MaxToolCalls)
-			case b.Name == ConfirmTool && !q.SendFreely:
-				armed = nil
-				var outcome int
-				var call ActCall
-				out, outcome, call = a.confirm(ctx, bud, cs, b, &confirms, q, &res, &frame, beat)
-				res.Calls = append(res.Calls, call)
-				results = append(results, anthropic.NewBetaToolResultBlock(b.ID, out, outcome != confirmYes))
-				beat()
-				switch outcome {
-				case confirmYes:
-					armed = &call.Outline
-				case confirmEnd:
-					cancelled = true
-				}
-				continue
-			default:
-				if why := refuse(b, res.Allowed); why != "" {
-					out = why
-					break
-				}
-				if typesInto(b) && password(lctx, cs, b) {
-					out, redact = notPassword, true
-					break
-				}
-				if armed != nil {
-					outline := *armed
-					armed = nil // one action, whatever comes of it
-					name := strings.TrimPrefix(b.Name, actConnector+"__")
-					switch {
-					case name != "browser_click" && name != "browser_press_key":
-						out = "Not run: after a confirmation, the next action must be the click or key press that sends the form. The confirmation is cancelled: call confirm again when the form is ready."
-					case pageOutline(lctx, cs) != outline:
-						out = "Not run: the page changed since the person confirmed it. The confirmation is cancelled: call confirm again, saying what will be sent now."
-					case !runHold(lctx, cs, reed.ReleaseJS, "released"):
-						out = "Not run: the browser couldn't open the way for this send."
-					default:
-						out, isErr = ag.call(lctx, tb, b, &rec)
-						runHold(context.WithoutCancel(lctx), cs, reed.CloseJS, "closed") // the way closes after the one action
-					}
-					break
-				}
-				out, isErr = ag.call(lctx, tb, b, &rec)
-			}
-			if len(rec.Tools) == before { // not run: refused or over the limit
-				hitLimit = hitLimit || strings.Contains(out, "limit of")
-				if len(res.Calls) <= MaxToolCalls { // the one past the limit says so; later ones aren't recorded
-					in := clip(string(b.Input), RecordedOutput)
-					if redact {
-						in = redacted(b.Input) // what it would have typed isn't kept (review 40)
-					}
-					res.Calls = append(res.Calls, ActCall{Tool: strings.TrimPrefix(b.Name, actConnector+"__"), Input: in, Output: out, IsError: true})
-				}
-			} else {
-				tc := rec.Tools[len(rec.Tools)-1]
-				call := ActCall{Tool: tc.Tool, Input: red.text(tc.Input), Output: red.text(tc.Output), IsError: tc.IsError, Truncated: tc.Truncated, URL: red.text(currentURL(lctx, cs))}
-				if call.URL != "" {
-					res.URL = call.URL
-				}
-				if !observes[tc.Tool] {
-					if f, ok := screenshot(lctx, cs, res.URL, len(secrets)); ok {
-						frame, call.Shot = f, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(f.JPEG)
-					}
-				}
-				res.Calls = append(res.Calls, call)
-			}
-			beat()
-			if out == "" {
-				out = "(no output)"
-			}
-			results = append(results, anthropic.NewBetaToolResultBlock(b.ID, red.text(out), isErr))
+			out, isErr, outcome := do(b, string(msg.StopReason), false, "")
+			cancelled = outcome == confirmEnd
+			results = append(results, anthropic.NewBetaToolResultBlock(b.ID, out, isErr))
 		}
 		if cancelled {
 			res.Ended = EndedCancelled
@@ -849,7 +920,8 @@ func currentURL(ctx context.Context, cs *mcp.ClientSession) string {
 }
 
 // fitAct keeps a result within MaxResult: the oldest screenshots go first,
-// then calls' outputs, then their inputs, are cut.
+// then calls' outputs, then their inputs, are cut; then the script's
+// outlines' text, then the script.
 func fitAct(res *ActResult) {
 	size := func() int { b, _ := json.Marshal(res); return len(b) }
 	for i := 0; i < len(res.Calls) && size() > MaxResult; i++ {
@@ -864,6 +936,14 @@ func fitAct(res *ActResult) {
 		if len(res.Calls[i].Input) > 256 {
 			res.Calls[i].Input, res.Calls[i].Truncated = clip(res.Calls[i].Input, 256), true
 		}
+	}
+	// Then the script's outlines as text (each is still matched by its
+	// SHA-256), and last the script itself: the next run asks Claude.
+	for i := 0; i < len(res.Script) && size() > MaxResult; i++ {
+		res.Script[i].Outline = ""
+	}
+	if size() > MaxResult {
+		res.Script = []ScriptStep{}
 	}
 }
 
@@ -889,6 +969,10 @@ func ParseAct(out string) (r ActResult, ok bool) {
 		if c.Shot != "" && !jpegData.MatchString(c.Shot) {
 			return ActResult{}, false
 		}
+	}
+	if !validScript(r.Script) || (r.ScriptInputs != "" && !sha256Hex.MatchString(r.ScriptInputs)) ||
+		r.Replay != nil && (r.Replay.Steps < 0 || r.Replay.Replayed < 0 || r.Replay.Replayed > r.Replay.Steps || r.Replay.At < 0) {
+		return ActResult{}, false
 	}
 	return r, true
 }
@@ -926,7 +1010,7 @@ func ActCommand(a Act) weft.Arrow[plan.Input, string] {
 		if err != nil {
 			return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
 		}
-		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: o.hosts, SendFreely: o.freely, Uses: o.uses, Node: in.NodeID, Sources: sources(in.Upstream, pageSource)})
+		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: o.hosts, SendFreely: o.freely, Uses: o.uses, NoReplay: o.replay == "off", Node: in.NodeID, Sources: sources(in.Upstream, pageSource)})
 		var wait *RetryAfter
 		switch {
 		case ctx.Err() != nil && err != nil:
@@ -998,11 +1082,13 @@ type actOpts struct {
 	hosts  []string
 	freely bool     // :send-without-asking
 	uses   []string // :uses "name email"
+	replay string   // :replay "off" or "on" (roadmap 9.9)
 }
 
 // actOptions splits an act step's arguments after its start page into
 // further hosts and its options, each at most once:
-// :send-without-asking, and :uses followed by the details it may use.
+// :send-without-asking, :uses followed by the details it may use, and
+// :replay followed by "off" or "on" (roadmap 9.9).
 // Any other option is an error (a keyword can't be a host).
 func actOptions(args []string) (actOpts, error) {
 	var o actOpts
@@ -1020,8 +1106,13 @@ func actOptions(args []string) (actOpts, error) {
 				return actOpts{}, err
 			}
 			o.uses, i = u, i+1
+		case a == Replay && o.replay == "":
+			if i+1 == len(args) || (args[i+1] != "off" && args[i+1] != "on") {
+				return actOpts{}, fmt.Errorf("%w: %s is \"off\" or \"on\", such as %s \"off\"", ErrInvalid, Replay, Replay)
+			}
+			o.replay, i = args[i+1], i+1
 		case strings.HasPrefix(a, ":"):
-			return actOpts{}, fmt.Errorf("%w: act has no option %s, or has it twice (it has %s and %s)", ErrInvalid, a, SendFreely, Uses)
+			return actOpts{}, fmt.Errorf("%w: act has no option %s, or has it twice (it has %s, %s and %s)", ErrInvalid, a, SendFreely, Uses, Replay)
 		default:
 			o.hosts = append(o.hosts, a)
 		}
