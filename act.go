@@ -98,7 +98,7 @@ const ActSystem = `You are one step in a recorded pipeline, working a web browse
 // ActConfirmRule is added to ActSystem unless the step sends without
 // asking (roadmap 9.7).
 const ActConfirmRule = `
-- The browser sends nothing a form submits until the person confirms. Fill in every field first; then, right before each click that sends a form (Submit, Send, Next on a form page, Pay), call confirm with a one-sentence summary of what will be sent, naming each value. Wait for its answer: if it says to send, make that one click at once; if not, stop and say why. One confirmation sends one form.`
+- The browser sends nothing a form submits until the person confirms. Fill in every field first; then, right before each click that sends a form (Submit, Send, Next on a form page, Pay), call confirm with a one-sentence summary of what will be sent, naming each value. Wait for its answer: if it says to send, your very next action must be that one click (or the key press that sends): anything else, or a change to the page, cancels the confirmation. If it says not to send, stop and say why. One confirmation sends one form.`
 
 // ActBrowser starts act sessions: ReedBrowser, or a stand-in in tests.
 type ActBrowser interface {
@@ -175,6 +175,9 @@ type ActCall struct {
 	Truncated bool   `json:"truncated,omitempty"`
 	URL       string `json:"url,omitempty"`        // the page after it
 	Shot      string `json:"screenshot,omitempty"` // data:image/jpeg;base64,…, a frame of the page after it
+	// Outline is, for a confirm call, the page the person was shown (never
+	// recorded): a yes lets only an action on that same page send.
+	Outline string `json:"-"`
 }
 
 // ActResult is an act step's output: an Answer (Claude's final reply, so
@@ -309,6 +312,10 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	defer bud.stop()
 	lctx := bud.ctx
 	confirms := 0
+	// armed is the page a person confirmed a send on, its outline: only
+	// the next action may send, and only if it clicks or presses a key on
+	// that same page (review 41).
+	var armed *string
 	client := claude.client()
 	msgs := []anthropic.BetaMessageParam{anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(prompt))}
 	hitLimit := false
@@ -374,14 +381,17 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 				// grow without bound (review 39).
 				out = fmt.Sprintf("Not run: this step reached its limit of %d actions.", MaxToolCalls)
 			case b.Name == ConfirmTool && !q.SendFreely:
-				confirms++
-				var sent bool
+				armed = nil
+				var outcome int
 				var call ActCall
-				out, sent, call = a.confirm(ctx, bud, cs, b, confirms, q, &res, &frame, beat)
+				out, outcome, call = a.confirm(ctx, bud, cs, b, &confirms, q, &res, &frame, beat)
 				res.Calls = append(res.Calls, call)
-				results = append(results, anthropic.NewBetaToolResultBlock(b.ID, out, !sent))
+				results = append(results, anthropic.NewBetaToolResultBlock(b.ID, out, outcome != confirmYes))
 				beat()
-				if !sent {
+				switch outcome {
+				case confirmYes:
+					armed = &call.Outline
+				case confirmEnd:
 					cancelled = true
 				}
 				continue
@@ -392,6 +402,23 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 				}
 				if typesInto(b) && password(lctx, cs, b) {
 					out, redact = notPassword, true
+					break
+				}
+				if armed != nil {
+					outline := *armed
+					armed = nil // one action, whatever comes of it
+					name := strings.TrimPrefix(b.Name, actConnector+"__")
+					switch {
+					case name != "browser_click" && name != "browser_press_key":
+						out = "Not run: after a confirmation, the next action must be the click or key press that sends the form. The confirmation is cancelled: call confirm again when the form is ready."
+					case pageOutline(lctx, cs) != outline:
+						out = "Not run: the page changed since the person confirmed it. The confirmation is cancelled: call confirm again, saying what will be sent now."
+					case !runHold(lctx, cs, reed.ReleaseJS, "released"):
+						out = "Not run: the browser couldn't open the way for this send."
+					default:
+						out, isErr = ag.call(lctx, tb, b, &rec)
+						runHold(context.WithoutCancel(lctx), cs, reed.CloseJS, "closed") // the way closes after the one action
+					}
 					break
 				}
 				out, isErr = ag.call(lctx, tb, b, &rec)
@@ -443,11 +470,13 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 // confirm asks a person, through a.Confirm, whether to send the form
 // Claude's confirm call describes (roadmap 9.7). While it waits it beats
 // with the pending send and its screenshot, and the budget stands still.
-// A yes opens reed's hold for one send (reed.ReleaseJS); a no, no answer
-// within ConfirmTimeout, no way to ask, or too many sends, ends the step.
-// It returns what Claude is told, whether to send, and the call as
-// recorded.
-func (a Act) confirm(ctx context.Context, bud *budget, cs *mcp.ClientSession, b anthropic.BetaContentBlockUnion, n int, q ActQuestion, res *ActResult, frame *reed.Frame, beat func()) (string, bool, ActCall) {
+// A yes lets the next action send, if it is the click or key press that
+// sends on the page the person saw (the call's Outline): the loop opens
+// reed's hold just for it. A no, no answer within ConfirmTimeout, no way
+// to ask, or too many sends, ends the step; a confirm with no summary is
+// refused, uncounted, and Claude may ask again. It returns what Claude is
+// told, the outcome, and the call as recorded.
+func (a Act) confirm(ctx context.Context, bud *budget, cs *mcp.ClientSession, b anthropic.BetaContentBlockUnion, n *int, q ActQuestion, res *ActResult, frame *reed.Frame, beat func()) (string, int, ActCall) {
 	var in struct {
 		Summary string `json:"summary"`
 	}
@@ -457,16 +486,19 @@ func (a Act) confirm(ctx context.Context, bud *budget, cs *mcp.ClientSession, b 
 	if f, ok := screenshot(ctx, cs, call.URL); ok {
 		*frame, call.Shot = f, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(f.JPEG)
 	}
-	say := func(s string) (string, bool, ActCall) { call.Output = s; res.Text = s; return s, false, call }
-	switch {
-	case summary == "":
+	say := func(s string) (string, int, ActCall) { call.Output = s; res.Text = s; return s, confirmEnd, call }
+	if summary == "" {
 		call.Output = "Not asked: say what will be sent, naming each value."
-		return call.Output, true, call // not a no: Claude may ask again, and nothing was opened
-	case n > MaxConfirmations:
+		return call.Output, confirmAgain, call // not a no: Claude may ask again, and nothing was opened
+	}
+	*n++
+	switch {
+	case *n > MaxConfirmations:
 		return say(fmt.Sprintf("Not sent: this step may ask to send at most %d forms.", MaxConfirmations))
 	case a.Confirm == nil:
 		return say("Not sent: no one can confirm a send here, and this step may not send without asking.")
 	}
+	call.Outline = pageOutline(ctx, cs) // the page the person will see
 	var id [8]byte
 	rand.Read(id[:])
 	res.Pending = &ActPending{ID: hex.EncodeToString(id[:]), Node: q.Node, Summary: summary, URL: call.URL}
@@ -505,15 +537,53 @@ wait:
 	case !send:
 		return say("Not sent: the person cancelled it, so nothing was sent.")
 	}
-	cctx, ccancel := context.WithTimeout(ctx, ActionTimeout)
-	defer ccancel()
-	r, rerr := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_run_code_unsafe", Arguments: map[string]any{"code": reed.ReleaseJS}})
-	if rerr != nil || r.IsError || !strings.Contains(contentText(r.Content), "released") {
-		return say("Not sent: the person confirmed, but the browser couldn't open the way for it.")
-	}
-	call.Output, call.IsError = "Confirmed: send it now, with one click.", false
-	return call.Output, true, call
+	call.Output, call.IsError = "Confirmed: send it now. Your very next action must be the one click or key press that sends this form, on this page as it is.", false
+	return call.Output, confirmYes, call
 }
+
+// What came of a confirm call.
+const (
+	confirmAgain = iota // not asked: Claude may ask again
+	confirmYes          // the person said send
+	confirmEnd          // nothing is sent, and the step ends
+)
+
+// runHold runs one of reed's hold scripts (reed.ReleaseJS, reed.CloseJS)
+// through Playwright MCP, a tool no model is given, and says whether it
+// answered want.
+func runHold(ctx context.Context, cs *mcp.ClientSession, code, want string) bool {
+	cctx, cancel := context.WithTimeout(ctx, ActionTimeout)
+	defer cancel()
+	r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_run_code_unsafe", Arguments: map[string]any{"code": code}})
+	return err == nil && !r.IsError && strings.Contains(contentText(r.Content), want)
+}
+
+// pageOutline is the current page as an outline (Playwright MCP's
+// snapshot section, with each field's value), without the refs and
+// states that change between snapshots of the same page; "" if it can't
+// be read, which matches no page.
+func pageOutline(ctx context.Context, cs *mcp.ClientSession) string {
+	cctx, cancel := context.WithTimeout(ctx, ActionTimeout)
+	defer cancel()
+	r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_snapshot", Arguments: map[string]any{}})
+	if err != nil || r.IsError {
+		return ""
+	}
+	text := contentText(r.Content)
+	i := strings.Index(text, "### Snapshot\n")
+	if i < 0 {
+		return ""
+	}
+	text = text[i+len("### Snapshot\n"):]
+	if j := strings.Index(text, "\n### "); j >= 0 {
+		text = text[:j]
+	}
+	return volatile.ReplaceAllString(text, "")
+}
+
+// volatile are the parts of a snapshot that change between snapshots of
+// an unchanged page: element refs, focus and the pointer cursor.
+var volatile = regexp.MustCompile(` ?\[(ref=[a-z0-9]+|active|cursor=pointer)\]`)
 
 // heldSends are the sends reed's hold held (reed.HeldJS), at most
 // MaxBlockedRequests, and how many.
