@@ -153,6 +153,10 @@ type Agent struct {
 	// MCPTransport, if set, is how pirn reaches remote MCP servers itself
 	// (to list their writes); nil is http.DefaultTransport.
 	MCPTransport MCPRoundTripper
+	// system and noShell are set by act (roadmap 9.5), which asks Claude
+	// through an Agent with its own instructions and no bash tool.
+	system  string
+	noShell bool
 }
 
 func (a Agent) beat(res *AgentResult) {
@@ -337,12 +341,16 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 // it waits and tries again, up to askTries, so the session's work isn't
 // lost; a longer wait than maxWait, or a refusal, is returned.
 func (a Agent) ask(ctx context.Context, client anthropic.Client, tb *toolbox, msgs []anthropic.BetaMessageParam, res *AgentResult) (*anthropic.BetaMessage, error) {
+	system, tools := AgentSystem, append([]anthropic.BetaToolUnionParam{{OfBashTool20250124: &anthropic.BetaToolBash20250124Param{}}}, tb.tools...)
+	if a.noShell {
+		system, tools = a.system, tb.tools
+	}
 	params := anthropic.BetaMessageNewParams{
 		Model:     anthropic.Model(a.Claude.model()),
 		MaxTokens: MaxTokens,
-		System:    []anthropic.BetaTextBlockParam{{Text: AgentSystem}},
+		System:    []anthropic.BetaTextBlockParam{{Text: system}},
 		Messages:  msgs,
-		Tools:     append([]anthropic.BetaToolUnionParam{{OfBashTool20250124: &anthropic.BetaToolBash20250124Param{}}}, tb.tools...),
+		Tools:     tools,
 	}
 	if len(tb.servers) > 0 {
 		params.MCPServers = tb.servers
