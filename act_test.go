@@ -48,6 +48,11 @@ func fakeBrowser() *mcp.Server {
 		f.Close()
 	}
 	text := func(t string) *mcp.CallToolResult {
+		// With $FAKE_ECHO, a page shows the person's details as pages do:
+		// encoded, reformatted, spelled out (review 42).
+		if e := os.Getenv("FAKE_ECHO"); e != "" {
+			t += "\n" + e
+		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: t}}}
 	}
 	for _, name := range reed.ActTools {
@@ -104,9 +109,9 @@ func fakeBrowser() *mcp.Server {
 	// act opens reed's hold and reads what it held (roadmap 9.7); Claude
 	// never gets this tool.
 	mcp.AddTool(s, &mcp.Tool{Name: "browser_run_code_unsafe"}, func(_ context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
-		log("browser_run_code_unsafe", map[string]any{"code": map[any]string{reed.ReleaseJS: "release", reed.CloseJS: "close", reed.HeldJS: "held", reed.ShotJS: "shot"}[in["code"]]})
+		log("browser_run_code_unsafe", map[string]any{"code": map[any]string{reed.ReleaseJS: "release", reed.CloseJS: "close", reed.HeldJS: "held", reed.ShotJSFor(1): "shot", reed.ShotJSFor(2): "shot"}[in["code"]]})
 		switch in["code"] {
-		case reed.ShotJS:
+		case reed.ShotJSFor(1), reed.ShotJSFor(2):
 			var b bytes.Buffer
 			png.Encode(&b, image.NewRGBA(image.Rect(0, 0, reed.Width, reed.Height)))
 			q, _ := json.Marshal(base64.StdEncoding.EncodeToString(b.Bytes()))
@@ -952,6 +957,7 @@ func TestInv_ActStepsEndBeforeTheirBrowser(t *testing.T) {
 // before the browser starts. (Roadmap 9.8.)
 func TestInv_ActUsesOnlyGrantedDetails(t *testing.T) {
 	profile := map[string]string{"name": "Ada Lovelace", "email": "ada@example.org", "phone": "020 7946 0018", "address": "12 St James's Square, London", "birthdate": "1815-12-10"}
+	t.Setenv("FAKE_ECHO", "- link: https://forms.example.org/s?e=ada%40example.org&n=Ada+Lovelace&p=02079460018\n- text: A D A  L O V E L A C E, ADA@EXAMPLE.ORG, (020) 7946-0018\n- json: {\"e\":\"ada@example.org\"}\n- b64: "+base64.StdEncoding.EncodeToString([]byte("ada@example.org")))
 	var looked []string
 	lookup := func(_ context.Context, f string) (string, bool, error) {
 		looked = append(looked, f)
@@ -971,10 +977,13 @@ func TestInv_ActUsesOnlyGrantedDetails(t *testing.T) {
 	}
 	out := string(must(json.Marshal(res)))
 	sent, _ := json.Marshal(api.reqs)
-	for _, v := range profile {
-		if strings.Contains(out, v) || strings.Contains(string(sent), v) {
+	for _, v := range []string{"Ada Lovelace", "ada@example.org", "ada%40example.org", "Ada+Lovelace", "A D A  L O V E L A C E", "ADA@EXAMPLE.ORG", base64.StdEncoding.EncodeToString([]byte("ada@example.org"))} {
+		if strings.Contains(strings.ToLower(out), strings.ToLower(v)) || strings.Contains(strings.ToLower(string(sent)), strings.ToLower(v)) {
 			t.Errorf("%q in the record or Claude's prompts", v)
 		}
+	}
+	if !strings.Contains(string(sent), "e=⟨email⟩") || !strings.Contains(string(sent), "text: ⟨name⟩, ⟨email⟩") {
+		t.Errorf("not hidden as the placeholder: %s", sent)
 	}
 	sys, _ := json.Marshal(api.reqs[0]["system"])
 	if !strings.Contains(string(sys), "⟨name⟩: their name") || !strings.Contains(string(sys), "⟨email⟩") || strings.Contains(string(sys), "⟨phone⟩") {
@@ -985,6 +994,17 @@ func TestInv_ActUsesOnlyGrantedDetails(t *testing.T) {
 	}
 	if c := codes(t, b); !strings.HasPrefix(c, "use-profile ") || !strings.Contains(c, "shot") || strings.Contains(c, "browser_take_screenshot") || res.Calls[0].Shot == "" {
 		t.Errorf("frames weren't masked: %s", c)
+	}
+	// A phone number, reformatted or split by a page, is hidden too.
+	t.Setenv("FAKE_ECHO", "- shown: (020) 7946-0018 and 020-7946-0018 and +02079460018 and 020 / 7946 / 0018")
+	api = newActAPI(t, actTurn("tool_use", fill), actTurn("end_turn", `{"type":"text","text":"x"}`))
+	a, _ = newAct(t, api)
+	a.Profile = lookup
+	if _, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/", Uses: []string{"phone"}}); err != nil {
+		t.Fatal(err)
+	}
+	if sent, _ := json.Marshal(api.reqs); strings.Contains(string(sent), "7946") || !strings.Contains(string(sent), "shown: (⟨phone⟩ and ⟨phone⟩ and +⟨phone⟩ and ⟨phone⟩") {
+		t.Errorf("phone shown: %s", sent)
 	}
 	// Not set, or no way to read details: nothing starts.
 	for name, p := range map[string]func(context.Context, string) (string, bool, error){
