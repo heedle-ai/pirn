@@ -134,6 +134,10 @@ type Act struct {
 	Confirm func(context.Context, ActPending) (bool, error)
 	// ConfirmWithin overrides ConfirmTimeout when set.
 	ConfirmWithin time.Duration
+	// Profile looks up one of the person's details (ProfileFrom): only
+	// those a step's program names are ever looked up (roadmap 9.8). Nil
+	// means none can be used here.
+	Profile func(ctx context.Context, field string) (string, bool, error)
 }
 
 // ActPending is a send waiting for a person (roadmap 9.7): its ID (random,
@@ -164,6 +168,8 @@ type ActQuestion struct {
 	// SendFreely: the program let this step send without asking
 	// (:send-without-asking).
 	SendFreely bool
+	// Uses are the person's details the program lets it use (:uses).
+	Uses []string
 }
 
 // ActCall is one browser action, as recorded.
@@ -203,6 +209,8 @@ type ActResult struct {
 	HeldTotal int      `json:"heldTotal"`
 	// SendFreely: the step sent without asking, as its program let it.
 	SendFreely bool `json:"sendWithoutAsking,omitempty"`
+	// Uses are the details it could use, by name; never their values.
+	Uses []string `json:"uses,omitempty"`
 	// Pending is the send waiting for a person while it waits; never in
 	// the output.
 	Pending *ActPending `json:"-"`
@@ -232,6 +240,21 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	if err != nil {
 		return ActResult{}, err
 	}
+	// The details it may use, and only those, before anything starts.
+	secrets := map[string]string{}
+	for _, f := range q.Uses {
+		if a.Profile == nil {
+			return ActResult{}, fmt.Errorf("%w: this step uses your %s, and this worker can't read your details", ErrSetup, ProfileLabels[f])
+		}
+		v, ok, err := a.Profile(ctx, f)
+		switch {
+		case err != nil:
+			return ActResult{}, fmt.Errorf("%w: reading your %s: %v", ErrSetup, ProfileLabels[f], err)
+		case !ok:
+			return ActResult{}, fmt.Errorf("%w: this step uses your %s, which isn't set: set it under You on the Connectors page", ErrSetup, ProfileLabels[f])
+		}
+		secrets[Placeholder(f)] = v
+	}
 	s, err := a.Browser.Start(ctx, reed.Visit{URL: q.URL, Allow: q.Allow, Labels: visitLabels(ctx)})
 	switch {
 	case errors.Is(err, reed.ErrInvalid):
@@ -244,6 +267,11 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	defer s.Close()
 	if q.SendFreely {
 		if err := s.SendWithoutAsking(ctx); err != nil {
+			return ActResult{}, fmt.Errorf("%w: %v", ErrSetup, err)
+		}
+	}
+	if len(secrets) > 0 {
+		if err := s.UseProfile(ctx, secrets); err != nil {
 			return ActResult{}, fmt.Errorf("%w: %v", ErrSetup, err)
 		}
 	}
@@ -272,7 +300,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 			map[string]any{"summary": map[string]any{"type": "string", "description": "One sentence: what will be sent, naming each value."}}, []string{"summary"}))
 	}
 	res := ActResult{Answer: Answer{Pirn: 1, Model: claude.model()}, Act: 1, Image: a.Image,
-		Calls: []ActCall{}, Allowed: s.Allowed(), Blocked: []string{}, Inputs: []string{}, Held: []string{}, SendFreely: q.SendFreely}
+		Calls: []ActCall{}, Allowed: s.Allowed(), Blocked: []string{}, Inputs: []string{}, Held: []string{}, SendFreely: q.SendFreely, Uses: q.Uses}
 	var inputs strings.Builder
 	for _, src := range q.Sources {
 		res.Inputs = append(res.Inputs, src.ID)
@@ -305,6 +333,9 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	system := ActSystem
 	if !q.SendFreely {
 		system += ActConfirmRule
+	}
+	if len(q.Uses) > 0 {
+		system += profileRule(q.Uses)
 	}
 	ag := Agent{Claude: claude, CommandTimeout: ActionTimeout, system: system, noShell: true, OnProgress: func(AgentResult) { beat() }}
 	// The budget stands still while a person is asked (roadmap 9.7).
@@ -439,7 +470,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 					res.URL = call.URL
 				}
 				if !observes[tc.Tool] {
-					if f, ok := screenshot(lctx, cs, res.URL); ok {
+					if f, ok := screenshot(lctx, cs, res.URL, len(q.Uses) > 0); ok {
 						frame, call.Shot = f, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(f.JPEG)
 					}
 				}
@@ -483,7 +514,7 @@ func (a Act) confirm(ctx context.Context, bud *budget, cs *mcp.ClientSession, b 
 	json.Unmarshal(b.Input, &in)
 	summary := clip(strings.TrimSpace(in.Summary), 1024)
 	call := ActCall{Tool: ConfirmTool, Input: clip(string(b.Input), RecordedOutput), URL: currentURL(ctx, cs), IsError: true}
-	if f, ok := screenshot(ctx, cs, call.URL); ok {
+	if f, ok := screenshot(ctx, cs, call.URL, len(q.Uses) > 0); ok {
 		*frame, call.Shot = f, "data:image/jpeg;base64,"+base64.StdEncoding.EncodeToString(f.JPEG)
 	}
 	say := func(s string) (string, int, ActCall) { call.Output = s; res.Text = s; return s, confirmEnd, call }
@@ -884,11 +915,11 @@ func ActCommand(a Act) weft.Arrow[plan.Input, string] {
 			a.OnProgress = func(r ActResult, f reed.Frame) { activity.RecordHeartbeat(ctx, ActBeat{Frame: f, Pending: r.Pending}) }
 		}
 		ctx = stepContext(ctx, in.NodeID)
-		hosts, freely, err := actOptions(in.Args[2:])
+		o, err := actOptions(in.Args[2:])
 		if err != nil {
 			return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
 		}
-		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: hosts, SendFreely: freely, Node: in.NodeID, Sources: sources(in.Upstream, pageSource)})
+		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: o.hosts, SendFreely: o.freely, Uses: o.uses, Node: in.NodeID, Sources: sources(in.Upstream, pageSource)})
 		var wait *RetryAfter
 		switch {
 		case ctx.Err() != nil && err != nil:
@@ -922,11 +953,11 @@ func ActHosts(args []string) (hosts []string, ok bool) {
 	if len(args) < 2 {
 		return nil, false
 	}
-	allow, _, err := actOptions(args[2:])
+	o, err := actOptions(args[2:])
 	if err != nil {
 		return nil, false
 	}
-	h, err := reed.Visit{URL: args[1], Allow: allow}.Allowlist()
+	h, err := reed.Visit{URL: args[1], Allow: o.hosts}.Allowlist()
 	if err != nil {
 		return nil, false
 	}
@@ -941,25 +972,54 @@ func ActSendsFreely(args []string) (freely, ok bool) {
 	if len(args) < 2 {
 		return false, false
 	}
-	_, freely, err := actOptions(args[2:])
-	return freely, err == nil
+	o, err := actOptions(args[2:])
+	return o.freely, err == nil
+}
+
+// ActUses are the person's details an act step's arguments let it use
+// (:uses), and whether the arguments are valid (roadmap 9.8).
+func ActUses(args []string) (uses []string, ok bool) {
+	if len(args) < 2 {
+		return nil, false
+	}
+	o, err := actOptions(args[2:])
+	return o.uses, err == nil
+}
+
+// actOpts are an act step's further hosts and options.
+type actOpts struct {
+	hosts  []string
+	freely bool     // :send-without-asking
+	uses   []string // :uses "name email"
 }
 
 // actOptions splits an act step's arguments after its start page into
-// further hosts and its options: :send-without-asking, at most once. Any
-// other option is an error (a keyword can't be a host).
-func actOptions(args []string) (hosts []string, freely bool, err error) {
-	for _, a := range args {
+// further hosts and its options, each at most once:
+// :send-without-asking, and :uses followed by the details it may use.
+// Any other option is an error (a keyword can't be a host).
+func actOptions(args []string) (actOpts, error) {
+	var o actOpts
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch {
-		case a == SendFreely && !freely:
-			freely = true
+		case a == SendFreely && !o.freely:
+			o.freely = true
+		case a == Uses && o.uses == nil:
+			if i+1 == len(args) {
+				return actOpts{}, fmt.Errorf("%w: %s needs the details it may use, such as %s \"name email\"", ErrInvalid, Uses, Uses)
+			}
+			u, err := parseUses(args[i+1])
+			if err != nil {
+				return actOpts{}, err
+			}
+			o.uses, i = u, i+1
 		case strings.HasPrefix(a, ":"):
-			return nil, false, fmt.Errorf("%w: act has no option %s (it has %s)", ErrInvalid, a, SendFreely)
+			return actOpts{}, fmt.Errorf("%w: act has no option %s, or has it twice (it has %s and %s)", ErrInvalid, a, SendFreely, Uses)
 		default:
-			hosts = append(hosts, a)
+			o.hosts = append(o.hosts, a)
 		}
 	}
-	return hosts, freely, nil
+	return o, nil
 }
 
 // ActSession is one act step's browser (reed.Session).
@@ -967,6 +1027,9 @@ type ActSession interface {
 	Command(ctx context.Context) *exec.Cmd // Playwright MCP, over stdin and stdout
 	Allowed() []string
 	SendWithoutAsking(ctx context.Context) error // lifts the hold on sends (roadmap 9.7)
+	// UseProfile gives the browser the details a step may use, each under
+	// its placeholder (roadmap 9.8).
+	UseProfile(ctx context.Context, secrets map[string]string) error
 	Close()
 }
 
@@ -989,10 +1052,30 @@ func stdio(cmd *exec.Cmd) (mcp.Transport, error) {
 }
 
 // screenshot takes a screenshot through Playwright MCP (a tool Claude
-// isn't given) and makes a frame of it.
-func screenshot(ctx context.Context, cs *mcp.ClientSession, at string) (reed.Frame, bool) {
+// isn't given) and makes a frame of it. A step that uses the person's
+// details takes it with reed's ShotJS, which masks them (roadmap 9.8):
+// if that fails, there is no frame, never an unmasked one.
+func screenshot(ctx context.Context, cs *mcp.ClientSession, at string, masked bool) (reed.Frame, bool) {
 	cctx, cancel := context.WithTimeout(ctx, ActionTimeout)
 	defer cancel()
+	if masked {
+		r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_run_code_unsafe", Arguments: map[string]any{"code": reed.ShotJS}})
+		if err != nil || r.IsError {
+			return reed.Frame{}, false
+		}
+		text := contentText(r.Content)
+		var b64 string
+		i := strings.Index(text, "### Result\n\"")
+		if i < 0 || json.NewDecoder(strings.NewReader(text[i+len("### Result\n"):])).Decode(&b64) != nil {
+			return reed.Frame{}, false
+		}
+		img, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return reed.Frame{}, false
+		}
+		f, err := reed.FrameOf(at, img)
+		return f, err == nil
+	}
 	r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_take_screenshot", Arguments: map[string]any{"type": "jpeg", "scale": "css"}})
 	if err != nil || r.IsError {
 		return reed.Frame{}, false
