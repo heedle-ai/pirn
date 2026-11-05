@@ -146,6 +146,9 @@ func TestInv_ConnectorsAreChecked(t *testing.T) {
 		`{"connectors": [{"name": "x", "url": "https://a.b"}, {"name": "x", "url": "https://c.d"}]}`,
 		`{"connectors": [{"name": "X_y", "url": "https://a.b"}]}`,
 		`{"connectors": [{"name": "x", "image": "` + zeros + `", "command": ["s"], "secrets": {"A": "$(id)"}}]}`,
+		// Review 42: a connector can't be handed one of the person's details.
+		`{"connectors": [{"name": "x", "url": "https://a.b", "tokenEnv": "HEEDLE_PROFILE_EMAIL"}]}`,
+		`{"connectors": [{"name": "x", "image": "` + zeros + `", "command": ["s"], "secrets": {"A": "heedle_profile_name"}}]}`,
 	} {
 		if _, err := pirn.ReadConnectors(strings.NewReader(bad)); !errors.Is(err, pirn.ErrInvalid) {
 			t.Errorf("accepted %s", bad)
