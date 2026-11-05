@@ -3,8 +3,13 @@ package pirn
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"html"
+	"net/url"
+	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -32,7 +37,14 @@ const MaxProfileValue = 256
 func Placeholder(field string) string { return "⟨" + field + "⟩" }
 
 // ProfileKey is the keychain name a field is kept under.
-func ProfileKey(field string) string { return "HEEDLE_PROFILE_" + strings.ToUpper(field) }
+func ProfileKey(field string) string { return profilePrefix + strings.ToUpper(field) }
+
+const profilePrefix = "HEEDLE_PROFILE_"
+
+// IsProfileName reports whether a secret's name is one a detail is kept
+// under: no connector may name one, and the secret commands leave them be
+// (review 42), so a detail only ever reaches an act step that names it.
+func IsProfileName(name string) bool { return strings.HasPrefix(strings.ToUpper(name), profilePrefix) }
 
 // CheckProfile reports whether field is a detail and value one pirn keeps:
 // one line of 1 to MaxProfileValue bytes of text, no control characters.
@@ -120,4 +132,80 @@ func profileRule(uses []string) string {
 		fmt.Fprintf(&b, "  - %s: their %s\n", Placeholder(f), ProfileLabels[f])
 	}
 	return b.String()
+}
+
+// redactor hides the person's details in whatever reaches Claude or the
+// record (review 42): Playwright MCP hides only a value's exact copy, and
+// a page can show one encoded, reformatted or spelled out. Each value is
+// matched, ignoring case, as itself; URL-, form-, JSON-, HTML- and
+// base64-encoded; and as its letters and digits with up to three other
+// characters between each (spaced out, punctuated, or split), and is
+// replaced by its placeholder.
+type redactor struct {
+	re []*regexp.Regexp
+	ph []string
+}
+
+func newRedactor(secrets map[string]string) redactor {
+	var r redactor
+	phs := make([]string, 0, len(secrets))
+	for ph := range secrets {
+		phs = append(phs, ph)
+	}
+	sort.Slice(phs, func(i, j int) bool { return len(secrets[phs[i]]) > len(secrets[phs[j]]) })
+	for _, ph := range phs {
+		v := secrets[ph]
+		js, _ := json.Marshal(v)
+		forms := []string{v, url.QueryEscape(v), url.PathEscape(v), strings.ReplaceAll(url.QueryEscape(v), "+", "%20"),
+			strings.Trim(string(js), `"`), html.EscapeString(v),
+			base64.StdEncoding.EncodeToString([]byte(v)), base64.RawStdEncoding.EncodeToString([]byte(v)),
+			base64.URLEncoding.EncodeToString([]byte(v)), base64.RawURLEncoding.EncodeToString([]byte(v))}
+		var alts []string
+		for _, f := range forms {
+			alts = append(alts, regexp.QuoteMeta(f))
+		}
+		var chars []string
+		for _, c := range strings.ToLower(v) {
+			if unicode.IsLetter(c) || unicode.IsDigit(c) {
+				chars = append(chars, regexp.QuoteMeta(string(c)))
+			}
+		}
+		if len(chars) >= 3 {
+			alts = append(alts, strings.Join(chars, `[^\pL\pN]{0,3}`))
+		}
+		r.re = append(r.re, regexp.MustCompile(`(?i)(?:`+strings.Join(alts, "|")+`)`))
+		r.ph = append(r.ph, ph)
+	}
+	return r
+}
+
+// text is s with every detail hidden.
+func (r redactor) text(s string) string {
+	for i, re := range r.re {
+		s = re.ReplaceAllLiteralString(s, r.ph[i])
+	}
+	return s
+}
+
+// result hides every detail in what an act step records.
+func (r redactor) result(res *ActResult) {
+	if len(r.re) == 0 {
+		return
+	}
+	res.Text, res.URL = r.text(res.Text), r.text(res.URL)
+	for i := range res.Calls {
+		c := &res.Calls[i]
+		c.Input, c.Output, c.URL = r.text(c.Input), r.text(c.Output), r.text(c.URL)
+	}
+	for i := range res.Blocked {
+		res.Blocked[i] = r.text(res.Blocked[i])
+	}
+	for i := range res.Held {
+		res.Held[i] = r.text(res.Held[i])
+	}
+	if res.Pending != nil {
+		p := *res.Pending
+		p.Summary, p.URL = r.text(p.Summary), r.text(p.URL)
+		res.Pending = &p
+	}
 }
