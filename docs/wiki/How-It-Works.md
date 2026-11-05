@@ -195,6 +195,8 @@ Every container pirn starts carries heedle's labels (roadmap 9.2), so heedle can
 
 The run labels come from the step's context: the workflow that scheduled the step, its run, and the step's node ID. loom sets them where every step's activity starts. Otherwise the agent and act commands read them from Temporal's activity info with their own node ID, and `Agent.Run` (so `Step` and a skill's creation), and `RunWrite`, read the workflow and run without a step. A write runs in the run's own workflow after its steps, so its connector names the run itself. bobbin and reed write the same names, read the same values from Temporal, and follow the same rule for what a value may be (`TestInv_LabelSchemesAgree`).
 
+Each also carries `heedle.home`, the home whose worker started it (roadmap 9.2.1), when the worker's context carries one: loom's worker puts it on the context all its activities start from, so pirn passes nothing and an agent's workspace, a skill's creation, a connector's server and an act step's browser all say it. pirn gives an act visit the home from bobbin's context, so reed labels the browser the same way (`TestInv_PirnContainersSayTheirHome`).
+
 Temporal tells a step it was cancelled (`loom cancel`, or Stop run in the UI) only when the step heartbeats. So an agent step running in an activity heartbeats every 10 seconds while it runs, as well as after each command, and a cancel reaches it even while it waits on Claude. A step that has made no progress for 4 minutes stops heartbeating, so Temporal still notices a hung step (`TestInv_AgentStepsHeartbeatWhileTheyWait`).
 
 ## Laws
