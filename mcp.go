@@ -173,7 +173,7 @@ func (a Agent) openTools(ctx context.Context, g Grant) (*toolbox, error) {
 		if err != nil {
 			return nil, err
 		}
-		box, err := a.Runner.Start(ctx, bobbin.Spec{Image: c.Image, Secrets: secrets})
+		box, err := a.Runner.Start(ctx, bobbin.Spec{Image: c.Image, Secrets: secrets, Labels: bobbin.Labels{Kind: "connector"}})
 		if err != nil {
 			if errors.Is(err, bobbin.ErrInvalid) || errors.Is(err, bobbin.ErrSetup) {
 				return nil, fmt.Errorf("%w: connector %q: %v", ErrSetup, c.Name, err)
@@ -486,7 +486,9 @@ type WriteResult struct {
 // tool a write. Every failure is final ("WriteFailed"): a write is never
 // tried twice, so one whose outcome is unknown is reported as failed.
 func (a Agent) RunWrite(ctx context.Context, w Write) (WriteResult, error) {
-	res, err := a.runWrite(ctx, w)
+	// A write runs after the run's steps, in the run's own workflow: its
+	// connector is labelled with that run (PIRN-500).
+	res, err := a.runWrite(stepContext(ctx, ""), w)
 	if err != nil {
 		return WriteResult{}, temporal.NewNonRetryableApplicationError(err.Error(), "WriteFailed", nil)
 	}
@@ -523,7 +525,7 @@ func (a Agent) runWrite(ctx context.Context, w Write) (WriteResult, error) {
 		if err != nil {
 			return WriteResult{}, err
 		}
-		box, err := a.Runner.Start(ctx, bobbin.Spec{Image: c.Image, Secrets: secrets})
+		box, err := a.Runner.Start(ctx, bobbin.Spec{Image: c.Image, Secrets: secrets, Labels: bobbin.Labels{Kind: "connector"}})
 		if err != nil {
 			return WriteResult{}, err
 		}

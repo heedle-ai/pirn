@@ -119,6 +119,7 @@ func AgentCommand(a Agent) weft.Arrow[plan.Input, string] {
 		if err != nil {
 			return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
 		}
+		ctx = stepContext(ctx, in.NodeID)
 		return Step(ctx, a, Question{Instruction: in.Args[0], Sources: sources(in.Upstream, pageSource), Grant: g})
 	}
 }
@@ -132,6 +133,7 @@ func Sources(upstream map[string]string) []Source { return sources(upstream, pag
 // Errors are classified for Temporal as AgentCommand's are. Other agent
 // steps, such as a skill's, run through it too.
 func Step(ctx context.Context, a Agent, q Question) (string, error) {
+	ctx = stepContext(ctx, "")
 	if activity.IsActivity(ctx) {
 		a.OnProgress = func(r AgentResult) { activity.RecordHeartbeat(ctx, len(r.Commands)) }
 	}

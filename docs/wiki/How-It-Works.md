@@ -174,6 +174,19 @@ An `act` step (roadmap 9.5) fills in a form: Claude works a browser through Micr
 
 `ActHosts` gives the hosts an act step's arguments allow, as reed's allowlist reads them; loom and drawdown disclose them before a step runs.
 
+## heedle's labels
+
+Every container pirn starts carries heedle's labels (roadmap 9.2), so heedle can list its containers, stop the run one belongs to, and clean up after a run, without ever touching anything else on the machine ([bobbin → heedle's labels](https://github.com/heedle-ai/bobbin/wiki/How-It-Works#heedles-labels-and-tidying-up)). pirn names each container's kind:
+
+| Container | `heedle.kind` |
+|---|---|
+| An agent step's workspace | `agent` |
+| A skill step's workspace (a question with a skill, as treadle asks) | `skill` |
+| A local connector's MCP server, in a step or for a write | `connector` |
+| An act step's browser | `act` (reed sets it) |
+
+The run labels come from the step's context: the workflow that scheduled the step, its run, and the step's node ID. loom sets them where every step's activity starts. Otherwise the agent and act commands read them from Temporal's activity info with their own node ID, and `Step` and `RunWrite` read the workflow and run without a step. A write runs in the run's own workflow after its steps, so its connector names the run itself. bobbin and reed write the same names, read the same values from Temporal, and follow the same rule for what a value may be (`TestInv_LabelSchemesAgree`).
+
 ## Laws
 
 `ask` is a `weft.Arrow`, registered the same way as reed's `browse` and bobbin's `container`, so it composes under `pipe` and `par` exactly as they do. Two law tests check it with a deterministic stand-in for Claude: weft's identity laws (`TestLaw_AskIsAWeftArrow`), and that the question is a function of the step's inputs alone (`TestLaw_PromptIsAFunctionOfInputs`). Claude's answers themselves can differ between runs, so the laws hold up to the answer, which is why every answer is recorded with what it was given.

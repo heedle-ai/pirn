@@ -171,7 +171,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	if err != nil {
 		return ActResult{}, err
 	}
-	s, err := a.Browser.Start(ctx, reed.Visit{URL: q.URL, Allow: q.Allow})
+	s, err := a.Browser.Start(ctx, reed.Visit{URL: q.URL, Allow: q.Allow, Labels: visitLabels(ctx)})
 	switch {
 	case errors.Is(err, reed.ErrInvalid):
 		return ActResult{}, fmt.Errorf("%w: %v", ErrInvalid, err)
@@ -469,6 +469,7 @@ func ActCommand(a Act) weft.Arrow[plan.Input, string] {
 		if activity.IsActivity(ctx) {
 			a.OnProgress = func(_ ActResult, f reed.Frame) { activity.RecordHeartbeat(ctx, f) }
 		}
+		ctx = stepContext(ctx, in.NodeID)
 		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: in.Args[2:], Sources: sources(in.Upstream, pageSource)})
 		var wait *RetryAfter
 		switch {

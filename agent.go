@@ -213,7 +213,11 @@ func (a Agent) Run(ctx context.Context, q Question) (AgentResult, error) {
 		return AgentResult{}, err
 	}
 	defer tb.close()
-	s, err := a.Runner.Start(ctx, bobbin.Spec{Image: a.Image})
+	kind := "agent"
+	if q.Skill != nil {
+		kind = "skill"
+	}
+	s, err := a.Runner.Start(ctx, bobbin.Spec{Image: a.Image, Labels: bobbin.Labels{Kind: kind}})
 	if err != nil {
 		if errors.Is(err, bobbin.ErrInvalid) || errors.Is(err, bobbin.ErrSetup) {
 			return AgentResult{}, fmt.Errorf("%w: %v", ErrSetup, err)
