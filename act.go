@@ -141,6 +141,7 @@ type Act struct {
 // be sent, and the page; the live frame shows it.
 type ActPending struct {
 	ID      string `json:"id"`
+	Node    string `json:"node,omitempty"` // the step's node, in a program
 	Summary string `json:"summary"`
 	URL     string `json:"url"`
 }
@@ -159,6 +160,7 @@ type ActQuestion struct {
 	URL         string
 	Allow       []string
 	Sources     []Source
+	Node        string // the step's node, in a program: named in a pending send
 	// SendFreely: the program let this step send without asking
 	// (:send-without-asking).
 	SendFreely bool
@@ -375,7 +377,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 				confirms++
 				var sent bool
 				var call ActCall
-				out, sent, call = a.confirm(ctx, bud, cs, b, confirms, &res, &frame, beat)
+				out, sent, call = a.confirm(ctx, bud, cs, b, confirms, q, &res, &frame, beat)
 				res.Calls = append(res.Calls, call)
 				results = append(results, anthropic.NewBetaToolResultBlock(b.ID, out, !sent))
 				beat()
@@ -445,7 +447,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 // within ConfirmTimeout, no way to ask, or too many sends, ends the step.
 // It returns what Claude is told, whether to send, and the call as
 // recorded.
-func (a Act) confirm(ctx context.Context, bud *budget, cs *mcp.ClientSession, b anthropic.BetaContentBlockUnion, n int, res *ActResult, frame *reed.Frame, beat func()) (string, bool, ActCall) {
+func (a Act) confirm(ctx context.Context, bud *budget, cs *mcp.ClientSession, b anthropic.BetaContentBlockUnion, n int, q ActQuestion, res *ActResult, frame *reed.Frame, beat func()) (string, bool, ActCall) {
 	var in struct {
 		Summary string `json:"summary"`
 	}
@@ -467,7 +469,7 @@ func (a Act) confirm(ctx context.Context, bud *budget, cs *mcp.ClientSession, b 
 	}
 	var id [8]byte
 	rand.Read(id[:])
-	res.Pending = &ActPending{ID: hex.EncodeToString(id[:]), Summary: summary, URL: call.URL}
+	res.Pending = &ActPending{ID: hex.EncodeToString(id[:]), Node: q.Node, Summary: summary, URL: call.URL}
 	bud.pause()
 	defer bud.resume()
 	beat()
@@ -815,7 +817,7 @@ func ActCommand(a Act) weft.Arrow[plan.Input, string] {
 		if err != nil {
 			return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
 		}
-		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: hosts, SendFreely: freely, Sources: sources(in.Upstream, pageSource)})
+		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: hosts, SendFreely: freely, Node: in.NodeID, Sources: sources(in.Upstream, pageSource)})
 		var wait *RetryAfter
 		switch {
 		case ctx.Err() != nil && err != nil:
