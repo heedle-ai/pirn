@@ -57,6 +57,8 @@ Each attempt is one request to the Messages API through Anthropic's Go SDK, with
 - the SDK's environment defaults off, so no `ANTHROPIC_*` variable can redirect or re-sign a request;
 - a 2-minute limit (`AskTimeout`), inside shuttle's 3-minute step timeout.
 
+Every request Claude answers, an ask's or an agent or act step's turn, is noted the moment it answers on the `Meter` the context carries (`WithMeter`, `MeterFrom`): its model and its input and output tokens (`Call`). The step's output records the same counts only if the step succeeds; the meter sees them whatever becomes of the step, so loom can count the calls no record holds, such as an attempt that failed (roadmap 10.4.1, [loom → Costs](https://github.com/heedle-ai/loom/wiki/How-It-Works)). A request Claude refused used nothing and isn't noted. Without a meter nothing is counted.
+
 ## Errors
 
 | What happened | Temporal sees | Retried? |
