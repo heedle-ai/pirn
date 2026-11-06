@@ -83,8 +83,9 @@ func TestInv_EveryCallIsMetered(t *testing.T) {
 // Messages.New... such as NewStreaming) assigns its message and is
 // followed, in the same block, by MeterFrom(...).Add(...): as its own
 // statement, or in an "if err == nil" right after, never only in an error
-// branch (review 56 round 2). A request it couldn't see (the service in a
-// variable, or a batch) fails it. It returns how many it found.
+// branch (review 56 round 2). The service used any other way (in a
+// variable, a field, a struct literal, or for a batch) fails it, since a
+// request made through it couldn't be seen. It returns how many it found.
 func meteredSites(t *testing.T) int {
 	t.Helper()
 	isRequest := func(e ast.Expr) bool {
@@ -141,22 +142,20 @@ func meteredSites(t *testing.T) int {
 			return err
 		}
 		requests := 0
+		receivers := map[ast.Node]bool{} // the X.Messages of each request
 		ast.Inspect(f, func(n ast.Node) bool {
 			if c, ok := n.(*ast.CallExpr); ok && isRequest(c) {
 				requests++
+				receivers[c.Fun.(*ast.SelectorExpr).X] = true
 			}
-			// A request this check can't see: the Messages service kept
-			// in a variable (msgs := client.Messages; msgs.New(...)), or
-			// a batch. pirn makes neither (review 56 round 3).
-			if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "Batches" {
-				t.Errorf("%s: a batch request, which this check can't meter", fset.Position(sel.Pos()))
-			}
-			if as, ok := n.(*ast.AssignStmt); ok {
-				for _, r := range as.Rhs {
-					if sel, ok := r.(*ast.SelectorExpr); ok && sel.Sel.Name == "Messages" {
-						t.Errorf("%s: the Messages service kept in a variable, which this check can't follow", fset.Position(sel.Pos()))
-					}
-				}
+			return true
+		})
+		// The Messages service used any other way (kept in a variable,
+		// a field or a struct literal, or for a batch) is a request this
+		// check can't follow; pirn makes none (review 56 rounds 3, 4).
+		ast.Inspect(f, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok && sel.Sel.Name == "Messages" && !receivers[sel] {
+				t.Errorf("%s: the Messages service used other than as X.Messages.New...(...), which this check can't follow", fset.Position(sel.Pos()))
 			}
 			return true
 		})
