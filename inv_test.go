@@ -58,8 +58,9 @@ func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 				"vault.go":     {"os", "os/exec", "runtime", "sync"},
 				"act.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/url", "os/exec", "crypto/rand", "sync"}, // crypto/rand and sync: a pending send's ID and the paused budget (roadmap 9.7)
 				"heartbeat.go": {"sync"},
-				"profile.go":   {"slices", "unicode", "html", "net/url"},       // checking and hiding details (roadmap 9.8, review 42)
-				"replay.go":    {"github.com/modelcontextprotocol/go-sdk/mcp"}, // reading the page a replay checks (roadmap 9.9)
+				"profile.go":   {"slices", "unicode", "html", "net/url"},                                              // checking and hiding details (roadmap 9.8, review 42)
+				"replay.go":    {"github.com/modelcontextprotocol/go-sdk/mcp"},                                        // reading the page a replay checks (roadmap 9.9)
+				"wheel.go":     {"github.com/modelcontextprotocol/go-sdk/mcp", "crypto/rand", "sync", "unicode/utf8"}, // a person drives (roadmap 9.10)
 			}
 			if !allowed[p] && !slices.Contains(except[f], p) {
 				bad = append(bad, f+": "+p)

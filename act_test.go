@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +40,9 @@ import (
 func fakeBrowser() *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: "Playwright", Version: "fake"}, nil)
 	page := "https://forms.example.org/volunteer"
+	var field []rune // the field a person types into (roadmap 9.10)
+	replaced := false
+	caret := 0
 	focused := "" // the ref last clicked: e9 is a password field
 	snaps := 0    // with $FAKE_PAGE_CHANGES, each snapshot differs (a page changing itself)
 	navigated := false
@@ -53,6 +57,13 @@ func fakeBrowser() *mcp.Server {
 		// encoded, reformatted, spelled out (review 42).
 		if e := os.Getenv("FAKE_ECHO"); e != "" {
 			t += "\n" + e
+		}
+		// With $FAKE_ECHO_FILE, what the page shows from then on: what a
+		// person typed, say (roadmap 9.10).
+		if f := os.Getenv("FAKE_ECHO_FILE"); f != "" {
+			if b, err := os.ReadFile(f); err == nil {
+				t += "\n" + string(b)
+			}
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: t}}}
 	}
@@ -136,12 +147,74 @@ func fakeBrowser() *mcp.Server {
 	// act opens reed's hold and reads what it held (roadmap 9.7); Claude
 	// never gets this tool.
 	mcp.AddTool(s, &mcp.Tool{Name: "browser_run_code_unsafe"}, func(_ context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
-		log("browser_run_code_unsafe", map[string]any{"code": map[any]string{reed.ReleaseJS: "release", reed.CloseJS: "close", reed.HeldJS: "held", reed.ShotJSFor(1): "shot", reed.ShotJSFor(2): "shot"}[in["code"]]})
-		switch in["code"] {
-		case reed.ShotJSFor(1), reed.ShotJSFor(2):
+		code, _ := in["code"].(string)
+		name := map[string]string{reed.ReleaseJS: "release", reed.CloseJS: "close", reed.HeldJS: "held", reed.ShotJSFor(0): "shot", reed.ShotJSFor(1): "shot", reed.ShotJSFor(2): "shot",
+			reed.PersonJS: "person", reed.PersonDoneJS: "person-done", reed.TypedJS: "typed"}[code]
+		if name == "" && (strings.Contains(code, "page.mouse.click(") || strings.Contains(code, "page.keyboard.")) {
+			name = "input" // a person's click or key (roadmap 9.10); what they typed isn't logged
+		}
+		log("browser_run_code_unsafe", map[string]any{"code": name})
+		switch code {
+		case reed.PersonJS:
+			return text("### Result\n\"yours\"\n"), nil, nil
+		case reed.PersonDoneJS:
+			if os.Getenv("FAKE_PERSON_DONE_FAILS") != "" { // a dialog left open, say
+				return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "### Error\nmodal state"}}}, nil, nil
+			}
+			return text("### Result\n{\"sent\":[\"POST https://forms.example.org/volunteer/signin\"],\"total\":1}\n"), nil, nil
+		case reed.TypedJS:
+			// With $FAKE_TYPED, what the fields typed into hold at hand-back.
+			v, _ := json.Marshal(strings.Split(os.Getenv("FAKE_TYPED"), "\n"))
+			if os.Getenv("FAKE_TYPED") == "" {
+				v = []byte("[]")
+			}
+			return text("### Result\n{\"values\":" + string(v) + "}\n"), nil, nil
+		}
+		if name == "input" {
+			if strings.Contains(code, `press("Enter")`) { // the person signs in: the page moves on
+				page = "https://forms.example.org/volunteer/signed-in" + os.Getenv("FAKE_SIGNED_IN_QUERY")
+			}
+			if strings.Contains(code, "page.mouse.click(") {
+				return text("### Result\n\"clicked\"\n"), nil, nil
+			}
+			// The focused field, as a page's would be: characters go in at
+			// the caret, which the arrows, Home and End move; Tab and Enter
+			// move on to an empty field.
+			var key string
+			if m := regexp.MustCompile(`keyboard\.(?:type|press)\(("(?:[^"\\]|\\.)*")\)`).FindStringSubmatch(code); m != nil {
+				json.Unmarshal([]byte(m[1]), &key)
+			}
+			before := string(field)
+			switch key {
+			case "ArrowLeft":
+				caret = max(caret-1, 0)
+			case "ArrowRight":
+				caret = min(caret+1, len(field))
+			case "Home":
+				caret = 0
+			case "End":
+				caret = len(field)
+			case "Backspace":
+				if caret > 0 {
+					field, caret = append(field[:caret-1:caret-1], field[caret:]...), caret-1
+				}
+			case "Tab", "Shift+Tab", "Enter", "Escape":
+				field, caret = nil, 0
+			default:
+				field, caret = append(append(append([]rune{}, field[:caret]...), []rune(key)...), field[caret:]...), caret+len([]rune(key))
+			}
+			ans, _ := json.Marshal(map[string]any{"before": before, "after": string(field)})
+			if os.Getenv("FAKE_FIELD_REPLACED") != "" && (key == "g" || replaced) { // the page replaced its field: unmarked, unread from the last key on
+				replaced = true
+				ans, _ = json.Marshal(map[string]any{"before": nil, "after": nil})
+			}
+			return text("### Result\n" + string(ans) + "\n"), nil, nil
+		}
+		switch code {
+		case reed.ShotJSFor(0), reed.ShotJSFor(1), reed.ShotJSFor(2):
 			var b bytes.Buffer
 			png.Encode(&b, image.NewRGBA(image.Rect(0, 0, reed.Width, reed.Height)))
-			q, _ := json.Marshal(base64.StdEncoding.EncodeToString(b.Bytes()))
+			q, _ := json.Marshal(map[string]any{"image": base64.StdEncoding.EncodeToString(b.Bytes()), "rects": [][4]float64{{10, 10, 100, 20}}})
 			return text("### Result\n" + string(q) + "\n"), nil, nil
 		case reed.ReleaseJS:
 			return text("### Result\n\"released\"\n"), nil, nil
@@ -364,7 +437,7 @@ func TestInv_ActRecordsEveryAction(t *testing.T) {
 	for _, n := range reed.ActTools {
 		want = append(want, "browser__"+n)
 	}
-	want = append(want, pirn.ConfirmTool) // roadmap 9.7
+	want = append(want, pirn.ConfirmTool, pirn.AskPersonTool) // roadmap 9.7, 9.10
 	sort.Strings(want)
 	if strings.Join(names, " ") != strings.Join(want, " ") {
 		t.Errorf("Claude was offered %v", names)
@@ -381,7 +454,7 @@ func TestInv_ActRecordsEveryAction(t *testing.T) {
 	if strings.Count(string(msg), `\u003cinstruction\u003e`) != 1 || strings.Count(string(msg), `\u003c/source\u003e`) != 1 {
 		t.Errorf("an input forged the instruction tag: %s", msg)
 	}
-	if c := strings.Join(calls(t, b), " "); c != "browser_snapshot browser_navigate browser_tabs browser_take_screenshot browser_snapshot browser_tabs browser_evaluate browser_snapshot browser_fill_form browser_tabs browser_take_screenshot browser_snapshot browser_click browser_tabs browser_take_screenshot browser_network_requests browser_run_code_unsafe" {
+	if c := strings.Join(calls(t, b), " "); c != "browser_snapshot browser_navigate browser_tabs browser_run_code_unsafe browser_snapshot browser_tabs browser_evaluate browser_snapshot browser_fill_form browser_tabs browser_run_code_unsafe browser_snapshot browser_click browser_tabs browser_run_code_unsafe browser_network_requests browser_run_code_unsafe" {
 		t.Errorf("the browser ran: %s", c)
 	}
 }
@@ -971,6 +1044,10 @@ func TestInv_ActSendsWithoutAskingOnlyWhenTold(t *testing.T) {
 // may wait on, ends before reed stops its browser, so a person who
 // confirms late still finds it open. (Review 41.)
 func TestInv_ActStepsEndBeforeTheirBrowser(t *testing.T) {
+	// Every send it may wait on, and every hand-over (review 52).
+	if step := pirn.ActBudget + (pirn.MaxConfirmations+pirn.MaxHandOvers)*pirn.ConfirmTimeout; pirn.ActOptions.Timeout <= step {
+		t.Errorf("an act step may last %v, but may wait %v", pirn.ActOptions.Timeout, step)
+	}
 	if pirn.ActOptions.Timeout >= reed.SessionTimeout {
 		t.Errorf("an act step may last %v, its browser %v", pirn.ActOptions.Timeout, reed.SessionTimeout)
 	}

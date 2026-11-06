@@ -144,6 +144,9 @@ func profileRule(uses []string) string {
 type redactor struct {
 	re []*regexp.Regexp
 	ph []string
+	// fields hide short text a person typed (roadmap 9.10) where it is a
+	// field's whole value in a page outline: too short to hide everywhere.
+	fields []*regexp.Regexp
 }
 
 func newRedactor(secrets map[string]string) redactor {
@@ -184,12 +187,38 @@ func (r redactor) text(s string) string {
 	for i, re := range r.re {
 		s = re.ReplaceAllLiteralString(s, r.ph[i])
 	}
+	for _, re := range r.fields {
+		s = re.ReplaceAllString(s, "${1}"+TypedPlaceholder+"${2}")
+	}
 	return s
+}
+
+// withTyped is r hiding what a person typed while driving too (roadmap
+// 9.10): each run of at least MinTyped characters everywhere, as a detail
+// is, and a shorter one where it is a field's whole value in a page
+// outline or a tool's input.
+func (r redactor) withTyped(runs []string) redactor {
+	// Longest first, so a value containing a shorter one is hidden whole
+	// (review 52).
+	runs = slices.Clone(runs)
+	sort.SliceStable(runs, func(i, j int) bool { return len(runs[i]) > len(runs[j]) })
+	for _, t := range runs {
+		if len([]rune(t)) >= MinTyped {
+			x := newRedactor(map[string]string{TypedPlaceholder: t})
+			r.re, r.ph = append(r.re, x.re...), append(r.ph, x.ph...)
+			continue
+		}
+		q := regexp.QuoteMeta(t)
+		r.fields = append(r.fields,
+			regexp.MustCompile(`(?m)(^\s*- (?:textbox|searchbox|spinbutton|combobox)\b[^\n]*?: )`+q+`()$`),
+			regexp.MustCompile(`("(?:value|text)":\s*")`+q+`(")`))
+	}
+	return r
 }
 
 // result hides every detail in what an act step records.
 func (r redactor) result(res *ActResult) {
-	if len(r.re) == 0 {
+	if len(r.re) == 0 && len(r.fields) == 0 {
 		return
 	}
 	res.Text, res.URL = r.text(res.Text), r.text(res.URL)
@@ -212,6 +241,9 @@ func (r redactor) result(res *ActResult) {
 	}
 	for i := range res.Held {
 		res.Held[i] = r.text(res.Held[i])
+	}
+	for i := range res.SentByYou {
+		res.SentByYou[i] = r.text(res.SentByYou[i])
 	}
 	if res.Pending != nil {
 		p := *res.Pending
