@@ -2,6 +2,9 @@ package pirn_test
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -64,27 +67,8 @@ func TestInv_EveryCallIsMetered(t *testing.T) {
 		t.Errorf("an act step's calls: %+v", got)
 	}
 
-	// Every request pirn makes is metered where Claude answers it: each
-	// call of the SDK's Messages.New is followed by MeterFrom(ctx).Add.
-	files, _ := filepath.Glob("*.go")
-	sites := 0
-	for _, f := range files {
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		b, _ := os.ReadFile(f)
-		lines := strings.Split(string(b), "\n")
-		for i, l := range lines {
-			if !strings.Contains(l, "Messages.New(") {
-				continue
-			}
-			sites++
-			if !strings.Contains(strings.Join(lines[i:min(i+20, len(lines))], "\n"), "MeterFrom(ctx).Add(") {
-				t.Errorf("%s:%d: a request to Claude that isn't metered", f, i+1)
-			}
-		}
-	}
-	if sites < 2 {
+	// Every request pirn makes is metered where Claude answers it.
+	if sites := meteredSites(t); sites < 2 {
 		t.Errorf("found %d requests to Claude; pirn makes at least an ask's and an agent turn's", sites)
 	}
 	var none *pirn.Meter
@@ -92,4 +76,108 @@ func TestInv_EveryCallIsMetered(t *testing.T) {
 	if none.Calls() != nil || pirn.MeterFrom(ctx) != nil {
 		t.Error("no meter should count nothing")
 	}
+}
+
+// meteredSites checks, in every Go file of pirn but tests (any folder),
+// that each request to Claude (a call of the SDK's Messages.New, or any
+// Messages.New... such as NewStreaming) assigns its message and is
+// followed, in the same block, by MeterFrom(...).Add(...): as its own
+// statement, or in an "if err == nil" right after, never only in an error
+// branch (review 56 round 2). It returns how many it found.
+func meteredSites(t *testing.T) int {
+	t.Helper()
+	isRequest := func(e ast.Expr) bool {
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || !strings.HasPrefix(sel.Sel.Name, "New") {
+			return false
+		}
+		recv, ok := sel.X.(*ast.SelectorExpr)
+		return ok && recv.Sel.Name == "Messages"
+	}
+	isAdd := func(n ast.Node) bool {
+		found := false
+		ast.Inspect(n, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Add" {
+					if inner, ok := sel.X.(*ast.CallExpr); ok {
+						if id, ok := inner.Fun.(*ast.Ident); ok && id.Name == "MeterFrom" {
+							found = true
+						}
+					}
+				}
+			}
+			return !found
+		})
+		return found
+	}
+	isErrNil := func(e ast.Expr) bool {
+		b, ok := e.(*ast.BinaryExpr)
+		if !ok || b.Op != token.EQL {
+			return false
+		}
+		x, ok1 := b.X.(*ast.Ident)
+		y, ok2 := b.Y.(*ast.Ident)
+		return ok1 && ok2 && x.Name == "err" && y.Name == "nil"
+	}
+	sites := 0
+	fset := token.NewFileSet()
+	err := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() && (d.Name() == "testdata" || strings.HasPrefix(d.Name(), ".")) && path != "." {
+			if err == nil {
+				return filepath.SkipDir
+			}
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			return err
+		}
+		requests := 0
+		ast.Inspect(f, func(n ast.Node) bool {
+			if c, ok := n.(*ast.CallExpr); ok && isRequest(c) {
+				requests++
+			}
+			return true
+		})
+		metered := 0
+		ast.Inspect(f, func(n ast.Node) bool {
+			b, ok := n.(*ast.BlockStmt)
+			if !ok {
+				return true
+			}
+			for i, st := range b.List {
+				as, ok := st.(*ast.AssignStmt)
+				if !ok || len(as.Rhs) != 1 || !isRequest(as.Rhs[0]) {
+					continue
+				}
+				for _, next := range b.List[i+1:] {
+					if ex, ok := next.(*ast.ExprStmt); ok && isAdd(ex) {
+						metered++
+						break
+					}
+					if is, ok := next.(*ast.IfStmt); ok && isErrNil(is.Cond) && isAdd(is.Body) {
+						metered++
+						break
+					}
+				}
+			}
+			return true
+		})
+		sites += requests
+		if metered != requests {
+			t.Errorf("%s: %d requests to Claude, %d of them metered where Claude answers", path, requests, metered)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sites
 }
