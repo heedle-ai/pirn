@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os/exec"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -64,6 +65,11 @@ const (
 	// step send without it.
 	ConfirmTool = "confirm"
 	SendFreely  = ":send-without-asking"
+	// SignedIn is the option (:signed-in "host …") that lets a step start
+	// signed in as the person on those of its hosts, with the sign-ins
+	// they kept (roadmap 9.11): a program says so, and is shown so, or it
+	// starts signed out.
+	SignedIn = ":signed-in"
 )
 
 // ActOptions are how act steps run: one attempt only, so a form is never
@@ -187,6 +193,9 @@ type ActQuestion struct {
 	Uses []string
 	// NoReplay: the program said :replay "off", so Claude does it all.
 	NoReplay bool
+	// SignedIn are the hosts the program lets it start signed in on
+	// (:signed-in), with the sign-ins the person kept there (roadmap 9.11).
+	SignedIn []string
 }
 
 // ActCall is one browser action, as recorded.
@@ -250,6 +259,8 @@ type ActResult struct {
 	// (roadmap 9.11). Never what a sign-in holds.
 	SignedIn []string `json:"signedIn,omitempty"`
 	Kept     string   `json:"keptSignIn,omitempty"`
+	// NotKept says why a sign-in the person asked to keep wasn't kept.
+	NotKept string `json:"notKept,omitempty"`
 }
 
 // observes are the tools that only read: no screenshot is taken after them.
@@ -291,26 +302,23 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 		}
 		secrets[Placeholder(f)] = v
 	}
-	// Saved sign-ins for its hosts, each matched exactly (roadmap 9.11):
-	// a step signed in as the person never sends without asking.
-	var signedIn []string
+	// The sign-ins its program lets it start with (:signed-in), each one
+	// of its hosts, matched exactly, and only those (roadmap 9.11): a step
+	// signed in as the person never sends without asking.
+	if err := checkSignedIn(q.URL, actOpts{hosts: q.Allow, freely: q.SendFreely, signedIn: q.SignedIn}); err != nil {
+		return ActResult{}, err
+	}
+	var signedIn, signValues []string
 	var states [][]byte
 	if a.Sessions != nil {
-		hosts, err := reed.Visit{URL: q.URL, Allow: q.Allow}.Allowlist()
-		if err != nil {
-			return ActResult{}, fmt.Errorf("%w: %v", ErrInvalid, err)
-		}
-		for _, h := range hosts {
+		for _, h := range q.SignedIn {
 			st, ok, err := a.Sessions.Load(ctx, h)
 			if err != nil {
-				return ActResult{}, fmt.Errorf("%w: your sign-in on %s: %v", ErrSetup, h, err)
+				return ActResult{}, fmt.Errorf("%w: your sign-in on %s couldn't be read", ErrSetup, h) // never the vault's words
 			}
 			if mine, ok2 := ForHost(st, h); ok && ok2 {
 				signedIn, states = append(signedIn, h), append(states, mine)
 			}
-		}
-		if len(signedIn) > 0 && q.SendFreely {
-			return ActResult{}, fmt.Errorf("%w: this step would start signed in as you on %s, so it can't send without asking: take out :send-without-asking, or forget that sign-in", ErrInvalid, strings.Join(signedIn, ", "))
 		}
 	}
 	s, err := a.Browser.Start(ctx, reed.Visit{URL: q.URL, Allow: q.Allow, Labels: visitLabels(ctx)})
@@ -334,9 +342,11 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 		}
 	}
 	if len(states) > 0 {
-		if err := s.UseStorage(ctx, mergeStates(states)); err != nil {
+		state := mergeStates(states)
+		if err := s.UseStorage(ctx, state, signedIn); err != nil {
 			return ActResult{}, fmt.Errorf("%w: %v", ErrSetup, err) // never the state: reed's error doesn't hold it
 		}
+		signValues = reed.StorageValues(state)
 	}
 	sctx, stop := context.WithCancel(ctx)
 	defer stop()
@@ -355,6 +365,20 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	}
 	if len(tb.client) != len(reed.ActTools) {
 		return ActResult{}, fmt.Errorf("%w: the browser-agent image's Playwright MCP offers %d of the %d tools act uses: is the image the pinned one?", ErrSetup, len(tb.client), len(reed.ActTools))
+	}
+	if len(signedIn) > 0 {
+		// The browser's context starts with the sign-ins, then their file
+		// goes (review 53: it sat decrypted in the container for the step);
+		// only now are they used.
+		if !runHold(ctx, cs, reed.StartedJS, "started") {
+			return ActResult{}, fmt.Errorf("%w: the browser didn't start with your sign-ins", ErrSetup)
+		}
+		if err := s.DropStorage(ctx); err != nil {
+			return ActResult{}, fmt.Errorf("%w: %v", ErrSetup, err)
+		}
+		for _, h := range signedIn {
+			a.Sessions.Touch(ctx, h)
+		}
 	}
 
 	tb.tools = append(tb.tools, clientToolParam(AskPersonTool,
@@ -391,6 +415,9 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	var rec AgentResult
 	frame := reed.Frame{}
 	red := newRedactor(secrets) // details hidden from Claude, beats and the record (review 42)
+	// What the sign-ins hold is hidden wherever a page shows it, as a
+	// detail is (review 53).
+	red = red.withSignIn(signValues)
 	beat := func() {
 		if a.OnProgress != nil {
 			r := res
@@ -456,10 +483,14 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 			}
 			json.Unmarshal(b.Input, &in)
 			call := ActCall{Tool: AskPersonTool, Input: red.text(clip(string(b.Input), RecordedOutput)), Replayed: replayed}
-			o, isE, typed, sent, keep := a.takeWheel(ctx, bud, cs, red.text, red.text(clip(strings.TrimSpace(in.Reason), 300)), &handovers, q, &res, &frame, beat, len(secrets))
+			o, isE, typed, sent, keep, keepHost := a.takeWheel(ctx, bud, cs, red.text, red.text(clip(strings.TrimSpace(in.Reason), 300)), &handovers, q, &res, &frame, beat, len(secrets))
 			if keep { // the person kept their sign-in (roadmap 9.11)
-				if host, err := a.keepSession(lctx, cs, res.Allowed); err == nil {
-					res.Kept = host
+				if q.SendFreely {
+					res.NotKept = "a step that sends without asking keeps no sign-in"
+				} else if host, err := a.keepSession(lctx, cs, res.Allowed, keepHost); err == nil {
+					res.Kept, res.NotKept = host, ""
+				} else {
+					res.NotKept = notKept(err)
 				}
 			}
 			if len(typed) > 0 {
@@ -1114,7 +1145,7 @@ func ActCommand(a Act) weft.Arrow[plan.Input, string] {
 		if err != nil {
 			return "", temporal.NewNonRetryableApplicationError(err.Error(), "InvalidInput", nil)
 		}
-		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: o.hosts, SendFreely: o.freely, Uses: o.uses, NoReplay: o.replay == "off", Node: in.NodeID, Sources: sources(in.Upstream, pageSource)})
+		res, err := a.Run(ctx, ActQuestion{Instruction: in.Args[0], URL: in.Args[1], Allow: o.hosts, SendFreely: o.freely, Uses: o.uses, NoReplay: o.replay == "off", SignedIn: o.signedIn, Node: in.NodeID, Sources: sources(in.Upstream, pageSource)})
 		var wait *RetryAfter
 		switch {
 		case ctx.Err() != nil && err != nil:
@@ -1181,12 +1212,49 @@ func ActUses(args []string) (uses []string, ok bool) {
 	return o.uses, err == nil
 }
 
+// ActSignedIn are the hosts an act step's arguments let it start signed
+// in on (:signed-in), and whether the arguments are valid: each one of its
+// hosts, and not with :send-without-asking (roadmap 9.11).
+func ActSignedIn(args []string) (hosts []string, ok bool) {
+	if len(args) < 2 {
+		return nil, false
+	}
+	o, err := actOptions(args[2:])
+	if err != nil || checkSignedIn(args[1], o) != nil {
+		return nil, false
+	}
+	return o.signedIn, true
+}
+
+// checkSignedIn refuses :signed-in hosts that aren't the step's own, and
+// :signed-in with :send-without-asking: a step signed in as the person
+// always asks before it sends.
+func checkSignedIn(start string, o actOpts) error {
+	if len(o.signedIn) == 0 {
+		return nil
+	}
+	if o.freely {
+		return fmt.Errorf("%w: a step signed in as you can't send without asking: take out %s or %s", ErrInvalid, SendFreely, SignedIn)
+	}
+	allowed, err := reed.Visit{URL: start, Allow: o.hosts}.Allowlist()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
+	for _, h := range o.signedIn {
+		if !slices.Contains(allowed, h) {
+			return fmt.Errorf("%w: %s names %s, which isn't one of the step's hosts", ErrInvalid, SignedIn, h)
+		}
+	}
+	return nil
+}
+
 // actOpts are an act step's further hosts and options.
 type actOpts struct {
-	hosts  []string
-	freely bool     // :send-without-asking
-	uses   []string // :uses "name email"
-	replay string   // :replay "off" or "on" (roadmap 9.9)
+	hosts    []string
+	freely   bool     // :send-without-asking
+	uses     []string // :uses "name email"
+	replay   string   // :replay "off" or "on" (roadmap 9.9)
+	signedIn []string // :signed-in "host …"
 }
 
 // actOptions splits an act step's arguments after its start page into
@@ -1215,8 +1283,22 @@ func actOptions(args []string) (actOpts, error) {
 				return actOpts{}, fmt.Errorf("%w: %s is \"off\" or \"on\", such as %s \"off\"", ErrInvalid, Replay, Replay)
 			}
 			o.replay, i = args[i+1], i+1
+		case a == SignedIn && o.signedIn == nil:
+			var hs []string
+			if i+1 < len(args) {
+				for _, h := range strings.Fields(args[i+1]) {
+					if h = strings.ToLower(h); checkHost(h) == nil && !slices.Contains(hs, h) {
+						hs = append(hs, h)
+					}
+				}
+			}
+			if len(hs) == 0 {
+				return actOpts{}, fmt.Errorf("%w: %s needs the hosts it starts signed in on, such as %s \"forms.example.org\"", ErrInvalid, SignedIn, SignedIn)
+			}
+			sort.Strings(hs)
+			o.signedIn, i = hs, i+1
 		case strings.HasPrefix(a, ":"):
-			return actOpts{}, fmt.Errorf("%w: act has no option %s, or has it twice (it has %s, %s and %s)", ErrInvalid, a, SendFreely, Uses, Replay)
+			return actOpts{}, fmt.Errorf("%w: act has no option %s, or has it twice (it has %s, %s, %s and %s)", ErrInvalid, a, SendFreely, Uses, Replay, SignedIn)
 		default:
 			o.hosts = append(o.hosts, a)
 		}
@@ -1233,7 +1315,9 @@ type ActSession interface {
 	// its placeholder (roadmap 9.8).
 	UseProfile(ctx context.Context, secrets map[string]string) error
 	// UseStorage starts the browser with saved sign-ins (roadmap 9.11).
-	UseStorage(ctx context.Context, state []byte) error
+	// The browser drops the state once its context has it (DropStorage).
+	UseStorage(ctx context.Context, state []byte, hosts []string) error
+	DropStorage(ctx context.Context) error
 	Close()
 }
 

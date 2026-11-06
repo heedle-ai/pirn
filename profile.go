@@ -193,6 +193,20 @@ func (r redactor) text(s string) string {
 	return s
 }
 
+// SignInPlaceholder stands for a value a loaded sign-in holds (a cookie's
+// or local storage's), wherever a page shows it (roadmap 9.11).
+const SignInPlaceholder = "⟨your sign-in⟩"
+
+// withSignIn is r hiding the values a step's loaded sign-ins hold too,
+// everywhere, as a detail is (review 53).
+func (r redactor) withSignIn(values []string) redactor {
+	for _, v := range values {
+		x := newRedactor(map[string]string{SignInPlaceholder: v})
+		r.re, r.ph = append(r.re, x.re...), append(r.ph, x.ph...)
+	}
+	return r
+}
+
 // withTyped is r hiding what a person typed while driving too (roadmap
 // 9.10): each run of at least MinTyped characters everywhere, as a detail
 // is, and a shorter one where it is a field's whole value in a page
