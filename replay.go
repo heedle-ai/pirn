@@ -98,7 +98,11 @@ func InputsSHA(q ActQuestion) string {
 		Allow, Uses      []string
 		Sources          []Source
 		SendFreely       bool
-	}{q.Instruction, q.URL, q.Allow, q.Uses, q.Sources, q.SendFreely})
+		// A script recorded signed in replays only signed in, and one
+		// recorded signed out only signed out (review 53); a question
+		// without :signed-in hashes as before.
+		SignedIn []string `json:",omitempty"`
+	}{q.Instruction, q.URL, q.Allow, q.Uses, q.Sources, q.SendFreely, q.SignedIn})
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
 }
