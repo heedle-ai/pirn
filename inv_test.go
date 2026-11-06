@@ -56,12 +56,12 @@ func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 				"mcp.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/http", "github.com/anthropics/anthropic-sdk-go/packages/param"},
 				"connector.go": {"os", "net/url"},
 				"vault.go":     {"os", "os/exec", "runtime", "sync"},
-				"act.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/url", "os/exec", "crypto/rand", "sync"}, // crypto/rand and sync: a pending send's ID and the paused budget (roadmap 9.7)
+				"act.go":       {"github.com/modelcontextprotocol/go-sdk/mcp", "net/url", "os/exec", "crypto/rand", "sync", "slices"}, // crypto/rand and sync: a pending send's ID and the paused budget (roadmap 9.7)
 				"heartbeat.go": {"sync"},
-				"profile.go":   {"slices", "unicode", "html", "net/url"},                                              // checking and hiding details (roadmap 9.8, review 42)
-				"replay.go":    {"github.com/modelcontextprotocol/go-sdk/mcp"},                                        // reading the page a replay checks (roadmap 9.9)
-				"wheel.go":     {"github.com/modelcontextprotocol/go-sdk/mcp", "crypto/rand", "sync", "unicode/utf8"}, // a person drives (roadmap 9.10)
-				"sessions.go":  {"crypto/aes", "crypto/cipher", "crypto/rand", "net/url", "os", "path/filepath"},      // saved sign-ins, sealed with Go's own AES-GCM (roadmap 9.11)
+				"profile.go":   {"slices", "unicode", "html", "net/url"},                                                                   // checking and hiding details (roadmap 9.8, review 42)
+				"replay.go":    {"github.com/modelcontextprotocol/go-sdk/mcp"},                                                             // reading the page a replay checks (roadmap 9.9)
+				"wheel.go":     {"github.com/modelcontextprotocol/go-sdk/mcp", "crypto/rand", "sync", "unicode/utf8", "net/url", "slices"}, // a person drives (roadmap 9.10), and keeps a sign-in (9.11)
+				"sessions.go":  {"crypto/aes", "crypto/cipher", "crypto/rand", "net/url", "os", "path/filepath", "syscall"},                // saved sign-ins, sealed with Go's own AES-GCM (roadmap 9.11)
 			}
 			if !allowed[p] && !slices.Contains(except[f], p) {
 				bad = append(bad, f+": "+p)
