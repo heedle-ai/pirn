@@ -23,3 +23,6 @@ func SetStepBeatEvery(every, quiet time.Duration, beat func()) func() {
 
 // ReadsOnly are the tools a payment page allows besides leaving it.
 var ReadsOnly = readsOnly
+
+// HandedBack is handedBack, for tests.
+var HandedBack = handedBack
