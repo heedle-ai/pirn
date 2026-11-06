@@ -134,6 +134,10 @@ type Act struct {
 	Confirm func(context.Context, ActPending) (bool, error)
 	// ConfirmWithin overrides ConfirmTimeout when set.
 	ConfirmWithin time.Duration
+	// Sessions, if set, are the saved sign-ins (roadmap 9.11): a step
+	// starts signed in on each of its hosts that has one, and a person
+	// who takes the wheel may keep theirs. Nil means none.
+	Sessions *Sessions
 	// Wheels, if set, lets a person take the wheel when Claude asks
 	// (ask_person, roadmap 9.10): the UI driving it must share it. Nil
 	// means no one can here.
@@ -241,6 +245,11 @@ type ActResult struct {
 	Script       []ScriptStep `json:"script,omitempty"`
 	ScriptInputs string       `json:"scriptInputs,omitempty"`
 	Replay       *ActReplay   `json:"replay,omitempty"`
+	// SignedIn are the hosts it started signed in on, as the person, with
+	// their saved sign-ins; Kept the host whose sign-in the person kept
+	// (roadmap 9.11). Never what a sign-in holds.
+	SignedIn []string `json:"signedIn,omitempty"`
+	Kept     string   `json:"keptSignIn,omitempty"`
 }
 
 // observes are the tools that only read: no screenshot is taken after them.
@@ -282,6 +291,28 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 		}
 		secrets[Placeholder(f)] = v
 	}
+	// Saved sign-ins for its hosts, each matched exactly (roadmap 9.11):
+	// a step signed in as the person never sends without asking.
+	var signedIn []string
+	var states [][]byte
+	if a.Sessions != nil {
+		hosts, err := reed.Visit{URL: q.URL, Allow: q.Allow}.Allowlist()
+		if err != nil {
+			return ActResult{}, fmt.Errorf("%w: %v", ErrInvalid, err)
+		}
+		for _, h := range hosts {
+			st, ok, err := a.Sessions.Load(ctx, h)
+			if err != nil {
+				return ActResult{}, fmt.Errorf("%w: your sign-in on %s: %v", ErrSetup, h, err)
+			}
+			if mine, ok2 := ForHost(st, h); ok && ok2 {
+				signedIn, states = append(signedIn, h), append(states, mine)
+			}
+		}
+		if len(signedIn) > 0 && q.SendFreely {
+			return ActResult{}, fmt.Errorf("%w: this step would start signed in as you on %s, so it can't send without asking: take out :send-without-asking, or forget that sign-in", ErrInvalid, strings.Join(signedIn, ", "))
+		}
+	}
 	s, err := a.Browser.Start(ctx, reed.Visit{URL: q.URL, Allow: q.Allow, Labels: visitLabels(ctx)})
 	switch {
 	case errors.Is(err, reed.ErrInvalid):
@@ -300,6 +331,11 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	if len(secrets) > 0 {
 		if err := s.UseProfile(ctx, secrets); err != nil {
 			return ActResult{}, fmt.Errorf("%w: %v", ErrSetup, err)
+		}
+	}
+	if len(states) > 0 {
+		if err := s.UseStorage(ctx, mergeStates(states)); err != nil {
+			return ActResult{}, fmt.Errorf("%w: %v", ErrSetup, err) // never the state: reed's error doesn't hold it
 		}
 	}
 	sctx, stop := context.WithCancel(ctx)
@@ -331,7 +367,7 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 	}
 	res := ActResult{Answer: Answer{Pirn: 1, Model: claude.model()}, Act: 1, Image: a.Image,
 		Calls: []ActCall{}, Allowed: s.Allowed(), Blocked: []string{}, Inputs: []string{}, Held: []string{}, SendFreely: q.SendFreely, Uses: q.Uses,
-		Script: []ScriptStep{}, ScriptInputs: InputsSHA(q)}
+		Script: []ScriptStep{}, ScriptInputs: InputsSHA(q), SignedIn: signedIn}
 	var inputs strings.Builder
 	for _, src := range q.Sources {
 		res.Inputs = append(res.Inputs, src.ID)
@@ -420,7 +456,12 @@ func (a Act) Run(ctx context.Context, q ActQuestion) (ActResult, error) {
 			}
 			json.Unmarshal(b.Input, &in)
 			call := ActCall{Tool: AskPersonTool, Input: red.text(clip(string(b.Input), RecordedOutput)), Replayed: replayed}
-			o, isE, typed, sent := a.takeWheel(ctx, bud, cs, red.text, red.text(clip(strings.TrimSpace(in.Reason), 300)), &handovers, q, &res, &frame, beat, len(secrets))
+			o, isE, typed, sent, keep := a.takeWheel(ctx, bud, cs, red.text, red.text(clip(strings.TrimSpace(in.Reason), 300)), &handovers, q, &res, &frame, beat, len(secrets))
+			if keep { // the person kept their sign-in (roadmap 9.11)
+				if host, err := a.keepSession(lctx, cs, res.Allowed); err == nil {
+					res.Kept = host
+				}
+			}
 			if len(typed) > 0 {
 				red = red.withTyped(typed) // hidden from here on, everywhere
 			}
@@ -1191,6 +1232,8 @@ type ActSession interface {
 	// UseProfile gives the browser the details a step may use, each under
 	// its placeholder (roadmap 9.8).
 	UseProfile(ctx context.Context, secrets map[string]string) error
+	// UseStorage starts the browser with saved sign-ins (roadmap 9.11).
+	UseStorage(ctx context.Context, state []byte) error
 	Close()
 }
 

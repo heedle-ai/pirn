@@ -61,6 +61,7 @@ func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 				"profile.go":   {"slices", "unicode", "html", "net/url"},                                              // checking and hiding details (roadmap 9.8, review 42)
 				"replay.go":    {"github.com/modelcontextprotocol/go-sdk/mcp"},                                        // reading the page a replay checks (roadmap 9.9)
 				"wheel.go":     {"github.com/modelcontextprotocol/go-sdk/mcp", "crypto/rand", "sync", "unicode/utf8"}, // a person drives (roadmap 9.10)
+				"sessions.go":  {"crypto/aes", "crypto/cipher", "crypto/rand", "net/url", "os", "path/filepath"},      // saved sign-ins, sealed with Go's own AES-GCM (roadmap 9.11)
 			}
 			if !allowed[p] && !slices.Contains(except[f], p) {
 				bad = append(bad, f+": "+p)

@@ -155,6 +155,9 @@ func fakeBrowser() *mcp.Server {
 		}
 		log("browser_run_code_unsafe", map[string]any{"code": name})
 		switch code {
+		case reed.StorageJS: // the browser's sign-ins (roadmap 9.11): this site's and another's
+			st, _ := json.Marshal(`{"cookies":[{"name":"sid","value":"s3cr3t-cookie","domain":"forms.example.org","path":"/"},{"name":"ad","value":"other","domain":".example.org","path":"/"}],"origins":[{"origin":"https://forms.example.org","localStorage":[{"name":"token","value":"s3cr3t-local"}]},{"origin":"https://cdn.example.org","localStorage":[]}]}`)
+			return text("### Result\n" + string(st) + "\n"), nil, nil
 		case reed.PersonJS:
 			return text("### Result\n\"yours\"\n"), nil, nil
 		case reed.PersonDoneJS:
@@ -279,12 +282,21 @@ type fakeSession struct {
 	closed  bool
 	freely  bool
 	secrets map[string]string
+	storage []byte
 }
 
 func (s *fakeSession) UseProfile(_ context.Context, secrets map[string]string) error {
 	s.secrets = secrets
 	f, _ := os.OpenFile(s.calls, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	fmt.Fprintln(f, "use-profile {}")
+	f.Close()
+	return nil
+}
+
+func (s *fakeSession) UseStorage(_ context.Context, state []byte) error {
+	s.storage = state
+	f, _ := os.OpenFile(s.calls, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	fmt.Fprintln(f, "use-storage {}")
 	f.Close()
 	return nil
 }

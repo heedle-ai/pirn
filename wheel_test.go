@@ -75,7 +75,7 @@ func TestInv_PersonTakesTheWheel(t *testing.T) {
 	var drives int
 	seen := driver(t, &a, func(w *pirn.Wheel) {
 		if drives++; drives > 1 { // the second time: straight back
-			w.HandBack()
+			w.HandBack(false)
 			return
 		}
 		if f := w.Frame(); len(f.JPEG) == 0 {
@@ -95,7 +95,7 @@ func TestInv_PersonTakesTheWheel(t *testing.T) {
 		w.Key("Enter")
 		os.WriteFile(echo, []byte("- textbox \"Email\" [ref=e20]: ada.secret@example.org\n- textbox \"Code\" [ref=e21]: x9\n- text: otp-code-5521\n- text: ADA.SECRET@EXAMPLE.ORG"), 0o644)
 		time.Sleep(9 * time.Second) // longer than the whole budget
-		w.HandBack()
+		w.HandBack(false)
 		if err := w.Key("z"); !errors.Is(err, pirn.ErrNotWaiting) { // review 52: taken just after
 			t.Errorf("a key just after hand back: %v", err)
 		}
@@ -178,7 +178,7 @@ func TestInv_WheelOnlyWhileWaiting(t *testing.T) {
 		if n := strings.Count(codes(t, b), "shot"); n <= shots {
 			t.Errorf("frames taken while the person looks: %d", n-shots)
 		}
-		w.HandBack()
+		w.HandBack(false)
 	})
 	if _, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer"}); err != nil {
 		t.Fatal(err)
@@ -200,7 +200,7 @@ func TestInv_WheelOnlyWhileWaiting(t *testing.T) {
 		actTurn("end_turn", `{"type":"text","text":"Done.\nResult: finished"}`))
 	a, _ = newAct(t, api)
 	var back time.Time
-	driver(t, &a, func(w *pirn.Wheel) { back = time.Now(); w.HandBack() })
+	driver(t, &a, func(w *pirn.Wheel) { back = time.Now(); w.HandBack(false) })
 	if _, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer"}); err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestInv_WheelOnlyWhileWaiting(t *testing.T) {
 		api := newActAPI(t, append(turns, actTurn("end_turn", `{"type":"text","text":"x"}`))...)
 		a, _ := newAct(t, api)
 		if c.wheels {
-			driver(t, &a, func(w *pirn.Wheel) { w.HandBack() })
+			driver(t, &a, func(w *pirn.Wheel) { w.HandBack(false) })
 		}
 		res, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer"})
 		last := res.Calls[len(res.Calls)-1]
@@ -271,7 +271,7 @@ func TestInv_ReplacedFieldHidesEveryKey(t *testing.T) {
 			w.Key(k)
 		}
 		os.WriteFile(echo, []byte("- textbox \"Email\" [ref=e20]: ada.secret@example.org"), 0o644)
-		w.HandBack()
+		w.HandBack(false)
 	})
 	res, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer"})
 	if err != nil {
