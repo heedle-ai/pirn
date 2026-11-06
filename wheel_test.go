@@ -108,9 +108,16 @@ func TestInv_PersonTakesTheWheel(t *testing.T) {
 		mu.Unlock()
 		progress(r, f)
 	}
-	res, err := a.Run(context.Background(), pirn.ActQuestion{Instruction: "Change my delivery address.", URL: "https://forms.example.org/volunteer", Node: "n1"})
+	m := &pirn.Meter{}
+	res, err := a.Run(pirn.WithMeter(context.Background(), m), pirn.ActQuestion{Instruction: "Change my delivery address.", URL: "https://forms.example.org/volunteer", Node: "n1"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Every turn is metered once, before and after each pause: the wait
+	// is inside the same attempt, so its ledger entry holds them all
+	// (roadmap 10.4.1 with 9.10).
+	if got := len(m.Calls()); got != len(api.reqs) || got != 5 {
+		t.Errorf("metered %d calls across two pauses; Claude answered %d", got, len(api.reqs))
 	}
 	if len(*seen) != 2 || (*seen)[0].Reason != "The form asks me to sign in." || (*seen)[0].Node != "n1" || len((*seen)[0].ID) != 32 {
 		for _, c := range res.Calls {
