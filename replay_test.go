@@ -600,3 +600,41 @@ func TestInv_ReplayFindsTheSameOfTwins(t *testing.T) {
 		t.Errorf("clicked the other one:\n%s", data)
 	}
 }
+
+// TestInv_ReplaySignedInAsks: a script replays only for a question signed
+// in the same way (a :signed-in step's script recorded signed in), and a
+// replayed send of a signed-in step still waits on the person's yes
+// (review 53, roadmap 9.9 and 9.11).
+func TestInv_ReplaySignedInAsks(t *testing.T) {
+	in := signUp
+	in.SignedIn = []string{"forms.example.org"}
+	if pirn.InputsSHA(in) == pirn.InputsSHA(signUp) {
+		t.Fatal("signed in and signed out are the same question")
+	}
+	// Recorded signed in, replayed signed in: the send waits on the no.
+	api := newActAPI(t, actTurn("tool_use", navigate), actTurn("tool_use", look), actTurn("tool_use", fillName), actTurn("tool_use", askToSend), actTurn("tool_use", next), finished)
+	a, _ := newAct(t, api)
+	a.Confirm = func(context.Context, pirn.ActPending) (bool, error) { return true, nil }
+	rec, err := a.Run(context.Background(), in)
+	if err != nil || rec.Ended != pirn.EndedFinished {
+		t.Fatalf("%v %+v", err, rec)
+	}
+	prev := roundTrip(t, rec)
+	a, b := newAct(t, noClaude(t))
+	a.Script = from(prev, nil)
+	asked := 0
+	a.Confirm = func(context.Context, pirn.ActPending) (bool, error) { asked++; return false, nil }
+	res, err := a.Run(context.Background(), in)
+	if err != nil || asked != 1 || res.Ended != pirn.EndedCancelled || res.Replay == nil || res.Replay.Replayed != 2 {
+		t.Fatalf("%v asked %d %+v %+v", err, asked, res, res.Replay)
+	}
+	if c := codes(t, b); strings.Contains(c, "release") || strings.Contains(c, "browser_click") {
+		t.Errorf("sent: %s", c)
+	}
+	// The same script, for the step signed out: Claude, from the start.
+	a, _ = newAct(t, newActAPI(t, finished))
+	a.Script = from(prev, nil)
+	if res, err := a.Run(context.Background(), signUp); err != nil || res.Replay == nil || res.Replay.Replayed != 0 {
+		t.Errorf("replayed signed out: %v %+v", err, res.Replay)
+	}
+}

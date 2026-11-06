@@ -327,10 +327,20 @@ func TestInv_SessionsDontRace(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	s.Save(ctx, "forms.example.org", []byte(state))
-	s.Touch(ctx, "forms.example.org")
+	// Either nothing is left, file and key, or a file that opens with its
+	// key: never one that doesn't (review 53, round 2). Looked at before
+	// Load, which forgets one that doesn't open.
+	file := filepath.Join(s.Dir, "forms.example.org.session")
+	_, statErr := os.Stat(file)
+	_, keyOK := v[pirn.SessionKey("forms.example.org")]
+	if statErr != nil {
+		if keyOK {
+			t.Error("a key without its file")
+		}
+		return
+	}
 	if got, ok, err := s.Load(ctx, "forms.example.org"); err != nil || !ok || string(got) != state {
-		t.Errorf("after racing: %v %v", ok, err)
+		t.Errorf("after racing, a file that doesn't open: %v %v", ok, err)
 	}
 }
 

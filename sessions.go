@@ -94,12 +94,17 @@ func checkHost(host string) error {
 func (s Sessions) path(host string) string { return filepath.Join(s.Dir, host+".session") }
 
 // lock holds the folder's lock file (flock) for one change or reading:
-// two steps or a step and the UI never interleave (review 53). It makes
-// the folder, only the person able to read it, and refuses a folder that
-// is a symbolic link.
-func (s Sessions) lock() (func(), error) {
-	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
-		return nil, err
+// two steps or a step and the UI never interleave (review 53). Only
+// keeping one (make) makes the folder and tightens it to the person
+// alone; anything else finds no folder as nothing kept (os.ErrNotExist),
+// and changes no folder's permissions. A folder that is a symbolic link is
+// refused. The lock file stays in the folder: unlinked while held, another
+// waiter could lock a file no one else sees.
+func (s Sessions) lock(make bool) (func(), error) {
+	if make {
+		if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+			return nil, err
+		}
 	}
 	fi, err := os.Lstat(s.Dir)
 	if err != nil {
@@ -108,7 +113,7 @@ func (s Sessions) lock() (func(), error) {
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
 		return nil, fmt.Errorf("%w: %s isn't a folder of its own", ErrSetup, s.Dir)
 	}
-	if fi.Mode().Perm() != 0o700 {
+	if make && fi.Mode().Perm() != 0o700 {
 		if err := os.Chmod(s.Dir, 0o700); err != nil {
 			return nil, err
 		}
@@ -133,7 +138,7 @@ func (s Sessions) Save(ctx context.Context, host string, state []byte) error {
 	if len(state) > MaxSession || !json.Valid(state) {
 		return fmt.Errorf("%w: a session is a storage state of at most %d bytes", ErrInvalid, MaxSession)
 	}
-	unlock, err := s.lock()
+	unlock, err := s.lock(true)
 	if err != nil {
 		return err
 	}
@@ -217,7 +222,10 @@ func (s Sessions) Load(ctx context.Context, host string) ([]byte, bool, error) {
 	if checkHost(host) != nil {
 		return nil, false, nil
 	}
-	unlock, err := s.lock()
+	unlock, err := s.lock(false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil // no folder: nothing kept
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -262,7 +270,10 @@ func (s Sessions) Touch(ctx context.Context, host string) error {
 	if checkHost(host) != nil {
 		return nil
 	}
-	unlock, err := s.lock()
+	unlock, err := s.lock(false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // no folder: nothing kept
+	}
 	if err != nil {
 		return err
 	}
@@ -280,7 +291,10 @@ func (s Sessions) Forget(ctx context.Context, host string) error {
 	if err := checkHost(host); err != nil {
 		return err
 	}
-	unlock, err := s.lock()
+	unlock, err := s.lock(false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // no folder: nothing kept
+	}
 	if err != nil {
 		return err
 	}
@@ -305,7 +319,10 @@ func (s Sessions) List(ctx context.Context) ([]SessionInfo, error) {
 	if _, err := os.Lstat(s.Dir); errors.Is(err, os.ErrNotExist) {
 		return []SessionInfo{}, nil
 	}
-	unlock, err := s.lock()
+	unlock, err := s.lock(false)
+	if errors.Is(err, os.ErrNotExist) {
+		return []SessionInfo{}, nil // no folder: nothing kept
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +361,10 @@ func (s Sessions) ForgetAll(ctx context.Context) error {
 	if _, err := os.Lstat(s.Dir); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	unlock, err := s.lock()
+	unlock, err := s.lock(false)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil // no folder: nothing kept
+	}
 	if err != nil {
 		return err
 	}
