@@ -21,6 +21,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -108,6 +110,7 @@ type Wheel struct {
 	typed   []string
 	frame   reed.Frame
 	frameAt time.Time
+	keep    bool
 	done    chan struct{}
 	once    sync.Once
 }
@@ -229,9 +232,14 @@ func (w *Wheel) Frame() reed.Frame {
 }
 
 // HandBack gives the browser back to Claude: no input runs after it
-// returns (review 52: a key sent just after was still taken).
-func (w *Wheel) HandBack() {
+// returns (review 52: a key sent just after was still taken). With keep,
+// the person asks to keep the sign-in of the site the browser is on
+// (roadmap 9.11).
+func (w *Wheel) HandBack(keep bool) {
 	w.mu.Lock()
+	if !w.closed {
+		w.keep = keep
+	}
 	w.closed = true
 	w.mu.Unlock()
 	w.once.Do(func() { close(w.done) })
@@ -253,16 +261,16 @@ func (w *Wheel) close() []string {
 // returns what Claude is told (a fresh outline and that a person acted),
 // whether that's an error, the call as recorded, what they typed (to
 // hide), and what they sent.
-func (a Act) takeWheel(ctx context.Context, bud *budget, cs *mcp.ClientSession, hide func(string) string, reason string, n *int, q ActQuestion, res *ActResult, frame *reed.Frame, beat func(), details int) (out string, isErr bool, typed, sent []string) {
+func (a Act) takeWheel(ctx context.Context, bud *budget, cs *mcp.ClientSession, hide func(string) string, reason string, n *int, q ActQuestion, res *ActResult, frame *reed.Frame, beat func(), details int) (out string, isErr bool, typed, sent []string, keep bool) {
 	switch {
 	case reason == "":
-		return "Not asked: say, in one sentence, why you need the person.", true, nil, nil
+		return "Not asked: say, in one sentence, why you need the person.", true, nil, nil, false
 	case a.Wheels == nil:
-		return "No one can take the wheel here: stop, and say what the person needs to do.", true, nil, nil
+		return "No one can take the wheel here: stop, and say what the person needs to do.", true, nil, nil, false
 	case *n >= MaxHandOvers:
-		return fmt.Sprintf("Not asked: this step may hand the browser to a person at most %d times. Stop and say why.", MaxHandOvers), true, nil, nil
+		return fmt.Sprintf("Not asked: this step may hand the browser to a person at most %d times. Stop and say why.", MaxHandOvers), true, nil, nil, false
 	case !runHold(ctx, cs, reed.PersonJS, "yours"):
-		return "Not asked: no page is open yet. Open the start page first.", true, nil, nil
+		return "Not asked: no page is open yet. Open the start page first.", true, nil, nil, false
 	}
 	*n++
 	var id [16]byte
@@ -315,13 +323,48 @@ wait:
 		case <-ctx.Done():
 		}
 	}
+	w.mu.Lock()
+	keep = w.keep && handed
+	w.mu.Unlock()
 	switch {
 	case ctx.Err() != nil:
-		return "The step was stopped while it waited for the person.", true, typed, sent
+		return "The step was stopped while it waited for the person.", true, typed, sent, false
 	case !handed:
-		return fmt.Sprintf("No one took the wheel within %s. Stop and say what the person needs to do.", within), true, typed, sent
+		return fmt.Sprintf("No one took the wheel within %s. Stop and say what the person needs to do.", within), true, typed, sent, false
 	}
-	return "", false, typed, sent
+	return "", false, typed, sent, keep
+}
+
+// keepSession keeps the sign-in of the site the browser is on, which
+// must be one of the step's hosts: its storage state (reed's StorageJS,
+// a tool no model is given) for that host alone (ForHost), sealed in
+// Sessions (roadmap 9.11). It returns the host kept, or why not.
+func (a Act) keepSession(ctx context.Context, cs *mcp.ClientSession, allowed []string) (string, error) {
+	if a.Sessions == nil {
+		return "", fmt.Errorf("%w: this worker can't keep sign-ins", ErrSetup)
+	}
+	u, err := url.Parse(currentURL(ctx, cs))
+	if err != nil || !slices.Contains(allowed, strings.ToLower(u.Hostname())) {
+		return "", fmt.Errorf("%w: the browser isn't on one of the step's hosts", ErrInvalid)
+	}
+	host := strings.ToLower(u.Hostname())
+	cctx, cancel := context.WithTimeout(ctx, ActionTimeout)
+	defer cancel()
+	r, err := cs.CallTool(cctx, &mcp.CallToolParams{Name: "browser_run_code_unsafe", Arguments: map[string]any{"code": reed.StorageJS}})
+	if err != nil || r.IsError {
+		return "", fmt.Errorf("%w: the browser didn't give its sign-in", ErrSetup) // never what it holds
+	}
+	text := contentText(r.Content)
+	var state string
+	i := strings.Index(text, "### Result\n\"")
+	if i < 0 || json.NewDecoder(strings.NewReader(text[i+len("### Result\n"):])).Decode(&state) != nil {
+		return "", fmt.Errorf("%w: the browser didn't give its sign-in", ErrSetup)
+	}
+	mine, ok := ForHost([]byte(state), host)
+	if !ok {
+		return "", fmt.Errorf("%w: the browser holds no sign-in for %s", ErrInvalid, host)
+	}
+	return host, a.Sessions.Save(ctx, host, mine)
 }
 
 func newTicker() *time.Ticker { return time.NewTicker(10 * time.Second) }

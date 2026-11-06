@@ -149,6 +149,9 @@ func TestInv_ConnectorsAreChecked(t *testing.T) {
 		// Review 42: a connector can't be handed one of the person's details.
 		`{"connectors": [{"name": "x", "url": "https://a.b", "tokenEnv": "HEEDLE_PROFILE_EMAIL"}]}`,
 		`{"connectors": [{"name": "x", "image": "` + zeros + `", "command": ["s"], "secrets": {"A": "heedle_profile_name"}}]}`,
+		// Roadmap 9.11: nor a saved sign-in's key.
+		`{"connectors": [{"name": "x", "url": "https://a.b", "tokenEnv": "HEEDLE_SESSION_0123456789ABCDEF01234567"}]}`,
+		`{"connectors": [{"name": "x", "image": "` + zeros + `", "command": ["s"], "secrets": {"A": "heedle_session_x"}}]}`,
 	} {
 		if _, err := pirn.ReadConnectors(strings.NewReader(bad)); !errors.Is(err, pirn.ErrInvalid) {
 			t.Errorf("accepted %s", bad)

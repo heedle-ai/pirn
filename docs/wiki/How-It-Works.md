@@ -206,6 +206,14 @@ While it waits, and only then, you **drive** its browser: the step is in the pro
 
 **Hand back** (`Wheel.HandBack`) closes the hold and answers Claude's call: a person acted in this browser, what you sent yourself, and the page as you left it, as data no tag can open or close in; Claude carries on from there. A step a person acted in keeps no script ([Replay without Claude](#replay-without-claude)): a replay can't redo what they did, and a script with that gap would replay as if it were all of it, so the next run of the program is Claude's again.
 
+### Saved sign-ins
+
+When you hand back after signing in, you may tick **Keep me signed in on** the site (roadmap 9.11): `Wheel.HandBack(true)`. The step reads the browser's storage state (Playwright's own: cookies and local storage, reed's `StorageJS`), cuts it to that one site (`ForHost`: cookies whose domain is the host, with or without a leading dot, and the local storage of origins on it, matched exactly, never a parent domain's), and keeps it with `Sessions.Save`, only if the page you left is on one of the step's allowed hosts. Its record says which site it kept (`keptSignIn`), never what.
+
+A kept sign-in is a file of its own, `<host>.session` in `Sessions.Dir` (heedle up's `~/.heedle/sessions`, only you able to read it), holding the host and when it was kept and last used in the clear, and the storage state sealed with AES-256-GCM (Go's standard library), the host as associated data, so a file renamed to another host doesn't open. Its key is new each time it's kept, 32 random bytes, in the vault (the keychain heedle up uses) under `HEEDLE_SESSION_` and a hash of the host (`SessionKey`): the file is nothing without the keychain, and a file whose key has gone (`heedle secret delete --all`) is forgotten the next time a step looks for it. No connector and no `secret` command may name such a key.
+
+Before an act step's browser starts, it loads the kept sign-in of each of its allowed hosts, matched exactly (`Sessions.Load`), and the browser's context starts with them (reed's `UseStorage`); a step with none on its hosts starts signed out, as before. Its record lists the sites it started signed in on (`signedIn`). A step that would start signed in can't send without asking: `:send-without-asking` on it is refused before the browser starts. One unused for 30 days (`SessionTTL`) expires, file and key, when it's next looked for or listed. **Forget** (`Sessions.Forget`, drawdown's You) removes the file and the key; `heedle secret delete --all` removes them all.
+
 ## heedle's labels
 
 Every container pirn starts carries heedle's labels (roadmap 9.2), so heedle can list its containers, stop the run one belongs to, and clean up after a run, without ever touching anything else on the machine ([bobbin → heedle's labels](https://github.com/heedle-ai/bobbin/wiki/How-It-Works#heedles-labels-and-tidying-up)). pirn names each container's kind:
