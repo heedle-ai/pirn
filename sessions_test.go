@@ -8,10 +8,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/heedle-ai/pirn"
+	"github.com/heedle-ai/reed"
 )
 
 // Saved sign-ins per site (roadmap 9.11).
@@ -165,9 +167,17 @@ func TestInv_SessionLoadsOnlyForItsHost(t *testing.T) {
 	}
 	*now = now.Add(time.Hour)
 	t.Setenv("FAKE_ECHO", "- text: Your session: s3cr3t-cookie")
+	// A navigation the hold held carries what the page showed in its
+	// path; the record and every beat hide it (review 53, round 3).
+	t.Setenv("FAKE_HELD", "GET https://cdn.example.org/contact/s3cr3t-cookie")
 	api := newActAPI(t, actTurn("tool_use", browserUse("t1", "browser_snapshot", `{}`)), actTurn("end_turn", `{"type":"text","text":"Done.\nResult: finished"}`))
 	a, b := newAct(t, api)
 	a.Sessions = s
+	var beats []string
+	a.OnProgress = func(r pirn.ActResult, _ reed.Frame) {
+		j, _ := json.Marshal(r)
+		beats = append(beats, string(j))
+	}
 	res, err := a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer", Allow: []string{"cdn.example.org"}, SignedIn: []string{"forms.example.org"}})
 	if err != nil || strings.Join(res.SignedIn, " ") != "forms.example.org" || strings.Join(b.last.signed, " ") != "forms.example.org" || !b.last.dropped {
 		t.Fatalf("%v %v, dropped %v", err, res.SignedIn, b.last.dropped)
@@ -182,8 +192,11 @@ func TestInv_SessionLoadsOnlyForItsHost(t *testing.T) {
 	}
 	out, _ := json.Marshal(res)
 	sent, _ := json.Marshal(api.reqs)
-	if strings.Contains(string(out), "s3cr3t") || strings.Contains(string(sent), "s3cr3t") || !strings.Contains(string(out), `"signedIn":["forms.example.org"]`) || !strings.Contains(string(sent), pirn.SignInPlaceholder) {
+	if strings.Contains(string(out), "s3cr3t") || strings.Contains(string(sent), "s3cr3t") || strings.Contains(strings.Join(beats, ""), "s3cr3t") || !strings.Contains(string(out), `"signedIn":["forms.example.org"]`) || !strings.Contains(string(sent), pirn.SignInPlaceholder) {
 		t.Errorf("record %s", out)
+	}
+	if len(res.Held) != 1 || res.Held[0] != "GET https://cdn.example.org/contact/"+pirn.SignInPlaceholder {
+		t.Errorf("held %v", res.Held)
 	}
 	if list, _ := s.List(ctx); list[2].Host != "forms.example.org" || !list[2].Used.Equal(now.UTC()) || !list[0].Used.Before(now.UTC()) {
 		t.Errorf("used: %+v", list)
@@ -344,6 +357,56 @@ func TestInv_SessionsDontRace(t *testing.T) {
 	}
 }
 
+// TestInv_SessionsDontRace_Forced forces the interleaving that broke a
+// sign-in, rather than hoping for it (review 53, round 3): one keep
+// stores its key and stalls; another keep of the same site runs meanwhile;
+// the first then writes its file. Without the lock the file is sealed
+// with a key that's been replaced, and never opens again.
+func TestInv_SessionsDontRace_Forced(t *testing.T) {
+	ctx := context.Background()
+	s, v, _ := newSessions(t)
+	var mu sync.Mutex
+	g := &gateVault{lockedVault: lockedVault{v: v, mu: &mu}, in: make(chan struct{}), release: make(chan struct{})}
+	s.Vault = g
+	first := make(chan error, 1)
+	go func() { first <- s.Save(ctx, "forms.example.org", []byte(state)) }()
+	<-g.in // the first keep has stored its key and stalls
+	second := make(chan error, 1)
+	go func() {
+		second <- s.Save(ctx, "forms.example.org", []byte(state))
+	}()
+	select {
+	case err := <-second:
+		t.Errorf("a second keep finished while the first held the lock: %v", err)
+		second <- err // for the wait below
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(g.release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	<-second
+	if got, ok, err := s.Load(ctx, "forms.example.org"); err != nil || !ok || string(got) != state {
+		t.Errorf("after two keeps at once, the sign-in doesn't open: %v %v", ok, err)
+	}
+}
+
+// gateVault stalls in its first Store, after storing, until released.
+type gateVault struct {
+	lockedVault
+	stalled     atomic.Bool
+	in, release chan struct{}
+}
+
+func (g *gateVault) Store(ctx context.Context, n, val string) error {
+	err := g.lockedVault.Store(ctx, n, val)
+	if g.stalled.CompareAndSwap(false, true) { // only the first; sync.Once would stall the second too
+		close(g.in)
+		<-g.release
+	}
+	return err
+}
+
 // lockedVault is a memVault safe to use at once.
 type lockedVault struct {
 	v  memVault
@@ -364,4 +427,40 @@ func (l lockedVault) Delete(ctx context.Context, n string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.v.Delete(ctx, n)
+}
+
+// TestInv_OnlySaveTightensTheFolder: listing, loading, touching and
+// forgetting never create the sign-ins' folder or change its mode, so a
+// folder named by mistake keeps its own; only keeping one creates it, or
+// makes it the person's alone (review 53, rounds 2 and 3).
+func TestInv_OnlySaveTightensTheFolder(t *testing.T) {
+	ctx := context.Background()
+	s, _, _ := newSessions(t)
+	s.List(ctx)
+	s.Load(ctx, "forms.example.org")
+	s.Touch(ctx, "forms.example.org")
+	s.Forget(ctx, "forms.example.org")
+	s.ForgetAll(ctx)
+	if _, err := os.Stat(s.Dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("made the folder: %v", err)
+	}
+	if err := os.Mkdir(s.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(s.Dir, 0o755)
+	os.WriteFile(filepath.Join(s.Dir, "notes.txt"), []byte("mine"), 0o644)
+	s.List(ctx)
+	s.Load(ctx, "forms.example.org")
+	s.Touch(ctx, "forms.example.org")
+	s.Forget(ctx, "forms.example.org")
+	s.ForgetAll(ctx)
+	if fi, err := os.Stat(s.Dir); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Errorf("the folder's mode changed: %v %v", fi.Mode(), err)
+	}
+	if err := s.Save(ctx, "forms.example.org", []byte(state)); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(s.Dir); fi.Mode().Perm() != 0o700 {
+		t.Errorf("keeping one left it %v", fi.Mode())
+	}
 }

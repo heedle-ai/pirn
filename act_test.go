@@ -224,6 +224,12 @@ func fakeBrowser() *mcp.Server {
 		case reed.CloseJS:
 			return text("### Result\n\"closed\"\n"), nil, nil
 		case reed.HeldJS:
+			// With $FAKE_HELD, the request the hold held (review 53: a
+			// held navigation carries what a page showed in its URL).
+			if h := os.Getenv("FAKE_HELD"); h != "" {
+				q, _ := json.Marshal(map[string]any{"held": []string{h}, "total": 1})
+				return text("### Result\n" + string(q) + "\n"), nil, nil
+			}
 			return text("### Result\n{\"held\":[\"POST https://forms.example.org/volunteer/2\"],\"total\":1}\n"), nil, nil
 		}
 		panic("browser_run_code_unsafe ran " + fmt.Sprint(in["code"]))
