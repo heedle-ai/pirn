@@ -212,9 +212,7 @@ func fakeBrowser() *mcp.Server {
 		}
 		switch code {
 		case reed.ShotJSFor(0), reed.ShotJSFor(1), reed.ShotJSFor(2):
-			var b bytes.Buffer
-			png.Encode(&b, image.NewRGBA(image.Rect(0, 0, reed.Width, reed.Height)))
-			q, _ := json.Marshal(map[string]any{"image": base64.StdEncoding.EncodeToString(b.Bytes()), "rects": [][4]float64{{10, 10, 100, 20}}})
+			q, _ := json.Marshal(map[string]any{"image": base64.StdEncoding.EncodeToString(fakeShot()), "rects": [][4]float64{}})
 			return text("### Result\n" + string(q) + "\n"), nil, nil
 		case reed.ReleaseJS:
 			return text("### Result\n\"released\"\n"), nil, nil
@@ -1183,3 +1181,10 @@ func TestInv_DetailsAreKeptInTheKeychain(t *testing.T) {
 		}
 	}
 }
+
+// fakeShot is a blank screenshot the size of the page, encoded once.
+var fakeShot = sync.OnceValue(func() []byte {
+	var b bytes.Buffer
+	png.Encode(&b, image.NewRGBA(image.Rect(0, 0, reed.Width, reed.Height)))
+	return b.Bytes()
+})
