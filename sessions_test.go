@@ -201,6 +201,17 @@ func TestInv_SessionLoadsOnlyForItsHost(t *testing.T) {
 	if list, _ := s.List(ctx); list[2].Host != "forms.example.org" || !list[2].Used.Equal(now.UTC()) || !list[0].Used.Before(now.UTC()) {
 		t.Errorf("used: %+v", list)
 	}
+	// A named host with no kept sign-in isn't signed in: the hold still
+	// holds navigations to it, so a provider a sign-in hops through needs
+	// a sign-in of its own kept there (review 53, round 4).
+	if err := s.Forget(ctx, "cdn.example.org"); err != nil {
+		t.Fatal(err)
+	}
+	a, b = newAct(t, newActAPI(t, actTurn("end_turn", `{"type":"text","text":"x"}`)))
+	a.Sessions = s
+	if res, err := a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/", Allow: []string{"cdn.example.org"}, SignedIn: []string{"cdn.example.org", "forms.example.org"}}); err != nil || strings.Join(res.SignedIn, " ") != "forms.example.org" || strings.Join(b.last.signed, " ") != "forms.example.org" {
+		t.Errorf("a named host with nothing kept: %v %v, hold %v", err, res.SignedIn, b.last.signed)
+	}
 	// A program that doesn't name its hosts starts signed out, with a kept
 	// sign-in on each of them.
 	a, b = newAct(t, newActAPI(t, actTurn("end_turn", `{"type":"text","text":"x"}`)))
