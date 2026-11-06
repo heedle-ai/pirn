@@ -149,7 +149,7 @@ func fakeBrowser() *mcp.Server {
 	mcp.AddTool(s, &mcp.Tool{Name: "browser_run_code_unsafe"}, func(_ context.Context, _ *mcp.CallToolRequest, in map[string]any) (*mcp.CallToolResult, any, error) {
 		code, _ := in["code"].(string)
 		name := map[string]string{reed.ReleaseJS: "release", reed.CloseJS: "close", reed.HeldJS: "held", reed.ShotJSFor(0): "shot", reed.ShotJSFor(1): "shot", reed.ShotJSFor(2): "shot",
-			reed.PersonJS: "person", reed.PersonDoneJS: "person-done", reed.TypedJS: "typed"}[code]
+			reed.PersonJS: "person", reed.PersonDoneJS: "person-done", reed.TypedJS: "typed", reed.StartedJS: "started", reed.StorageJS: "storage"}[code]
 		if name == "" && (strings.Contains(code, "page.mouse.click(") || strings.Contains(code, "page.keyboard.")) {
 			name = "input" // a person's click or key (roadmap 9.10); what they typed isn't logged
 		}
@@ -160,6 +160,8 @@ func fakeBrowser() *mcp.Server {
 			return text("### Result\n" + string(st) + "\n"), nil, nil
 		case reed.PersonJS:
 			return text("### Result\n\"yours\"\n"), nil, nil
+		case reed.StartedJS:
+			return text("### Result\n\"started\"\n"), nil, nil
 		case reed.PersonDoneJS:
 			if os.Getenv("FAKE_PERSON_DONE_FAILS") != "" { // a dialog left open, say
 				return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: "### Error\nmodal state"}}}, nil, nil
@@ -283,6 +285,8 @@ type fakeSession struct {
 	freely  bool
 	secrets map[string]string
 	storage []byte
+	signed  []string
+	dropped bool
 }
 
 func (s *fakeSession) UseProfile(_ context.Context, secrets map[string]string) error {
@@ -293,10 +297,18 @@ func (s *fakeSession) UseProfile(_ context.Context, secrets map[string]string) e
 	return nil
 }
 
-func (s *fakeSession) UseStorage(_ context.Context, state []byte) error {
-	s.storage = state
+func (s *fakeSession) UseStorage(_ context.Context, state []byte, hosts []string) error {
+	s.storage, s.signed = state, hosts
 	f, _ := os.OpenFile(s.calls, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	fmt.Fprintln(f, "use-storage {}")
+	f.Close()
+	return nil
+}
+
+func (s *fakeSession) DropStorage(context.Context) error {
+	s.dropped = true
+	f, _ := os.OpenFile(s.calls, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	fmt.Fprintln(f, "drop-storage {}")
 	f.Close()
 	return nil
 }

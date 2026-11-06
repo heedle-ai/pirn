@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -92,6 +93,37 @@ func checkHost(host string) error {
 
 func (s Sessions) path(host string) string { return filepath.Join(s.Dir, host+".session") }
 
+// lock holds the folder's lock file (flock) for one change or reading:
+// two steps or a step and the UI never interleave (review 53). It makes
+// the folder, only the person able to read it, and refuses a folder that
+// is a symbolic link.
+func (s Sessions) lock() (func(), error) {
+	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
+		return nil, err
+	}
+	fi, err := os.Lstat(s.Dir)
+	if err != nil {
+		return nil, err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+		return nil, fmt.Errorf("%w: %s isn't a folder of its own", ErrSetup, s.Dir)
+	}
+	if fi.Mode().Perm() != 0o700 {
+		if err := os.Chmod(s.Dir, 0o700); err != nil {
+			return nil, err
+		}
+	}
+	f, err := os.OpenFile(filepath.Join(s.Dir, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+}
+
 // Save keeps state, Playwright's storage state for host alone (ForHost),
 // replacing any kept before: a new key in the vault, then the sealed file.
 func (s Sessions) Save(ctx context.Context, host string, state []byte) error {
@@ -101,12 +133,17 @@ func (s Sessions) Save(ctx context.Context, host string, state []byte) error {
 	if len(state) > MaxSession || !json.Valid(state) {
 		return fmt.Errorf("%w: a session is a storage state of at most %d bytes", ErrInvalid, MaxSession)
 	}
+	unlock, err := s.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return err
 	}
 	if err := s.Vault.Store(ctx, SessionKey(host), base64.RawURLEncoding.EncodeToString(key)); err != nil {
-		return err
+		return fmt.Errorf("%w: the keychain didn't keep the key", ErrSetup) // never its words
 	}
 	gcm, err := sealer(key)
 	if err != nil {
@@ -122,11 +159,9 @@ func (s Sessions) Save(ctx context.Context, host string, state []byte) error {
 	return s.write(f)
 }
 
-// write puts f in its file atomically, only the person able to read it.
+// write puts f in its file atomically, only the person able to read it;
+// the lock is held.
 func (s Sessions) write(f sessionFile) error {
-	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
-		return err
-	}
 	b, _ := json.Marshal(f)
 	tmp, err := os.CreateTemp(s.Dir, ".session-*")
 	if err != nil {
@@ -175,30 +210,36 @@ func (s Sessions) read(host string) (sessionFile, bool, error) {
 }
 
 // Load is host's session, if one is kept and not expired, decrypted with
-// its key; using it counts as using it. An expired one is forgotten.
+// its key. One expired, whose key has gone, or that doesn't open (a file
+// changed or from elsewhere) is forgotten, and the step starts signed out
+// (review 53). Using it is Touch's, once the browser has it.
 func (s Sessions) Load(ctx context.Context, host string) ([]byte, bool, error) {
 	if checkHost(host) != nil {
 		return nil, false, nil
 	}
-	f, ok, err := s.read(host)
-	if err != nil || !ok {
-		return nil, false, err
-	}
-	if s.now().Sub(f.Used) > SessionTTL {
-		return nil, false, s.Forget(ctx, host)
-	}
-	k, ok, err := s.Vault.Lookup(ctx, SessionKey(host))
+	unlock, err := s.lock()
 	if err != nil {
 		return nil, false, err
 	}
-	if !ok {
-		// Its key is gone (heedle secret delete --all, say): the file is
-		// nothing without it, so it is forgotten too.
-		return nil, false, s.Forget(ctx, host)
+	defer unlock()
+	f, ok, err := s.read(host)
+	switch {
+	case errors.Is(err, ErrInvalid):
+		return nil, false, s.forget(ctx, host)
+	case err != nil || !ok:
+		return nil, false, err
+	case s.now().Sub(f.Used) > SessionTTL:
+		return nil, false, s.forget(ctx, host)
+	}
+	k, ok, err := s.Vault.Lookup(ctx, SessionKey(host))
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: the keychain didn't answer", ErrSetup) // never its words
 	}
 	key, kerr := base64.RawURLEncoding.DecodeString(k)
-	if kerr != nil || len(key) != 32 {
-		return nil, false, fmt.Errorf("%w: the key for %s's session can't be read: forget it and sign in again", ErrSetup, host)
+	if !ok || kerr != nil || len(key) != 32 {
+		// Its key is gone (heedle secret delete --all, say): the file is
+		// nothing without it, so it is forgotten too.
+		return nil, false, s.forget(ctx, host)
 	}
 	nonce, _ := base64.StdEncoding.DecodeString(f.Nonce)
 	sealed, _ := base64.StdEncoding.DecodeString(f.Sealed)
@@ -207,17 +248,31 @@ func (s Sessions) Load(ctx context.Context, host string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	if len(nonce) != gcm.NonceSize() {
-		return nil, false, fmt.Errorf("%w: the session for %s can't be read", ErrInvalid, host)
+		return nil, false, s.forget(ctx, host)
 	}
 	state, err := gcm.Open(nil, nonce, sealed, []byte(host))
 	if err != nil {
-		return nil, false, fmt.Errorf("%w: the session for %s doesn't open with its key", ErrInvalid, host)
-	}
-	f.Used = s.now().UTC()
-	if err := s.write(f); err != nil {
-		return nil, false, err
+		return nil, false, s.forget(ctx, host)
 	}
 	return state, true, nil
+}
+
+// Touch counts host's session as used now: it has 30 more days.
+func (s Sessions) Touch(ctx context.Context, host string) error {
+	if checkHost(host) != nil {
+		return nil
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	f, ok, err := s.read(host) // read again under the lock: never a stale file written back
+	if err != nil || !ok {
+		return err
+	}
+	f.Used = s.now().UTC()
+	return s.write(f)
 }
 
 // Forget removes host's session: its file and its key.
@@ -225,19 +280,37 @@ func (s Sessions) Forget(ctx context.Context, host string) error {
 	if err := checkHost(host); err != nil {
 		return err
 	}
+	unlock, err := s.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.forget(ctx, host)
+}
+
+// forget is Forget with the lock held.
+func (s Sessions) forget(ctx context.Context, host string) error {
 	if err := os.Remove(s.path(host)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return s.Vault.Delete(ctx, SessionKey(host))
+	if err := s.Vault.Delete(ctx, SessionKey(host)); err != nil {
+		return fmt.Errorf("%w: the keychain didn't forget the key of %s's sign-in", ErrSetup, host) // never its words
+	}
+	return nil
 }
 
 // List is every session kept, by host; ones unused for SessionTTL are
 // forgotten first.
 func (s Sessions) List(ctx context.Context) ([]SessionInfo, error) {
-	es, err := os.ReadDir(s.Dir)
-	if errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(s.Dir); errors.Is(err, os.ErrNotExist) {
 		return []SessionInfo{}, nil
 	}
+	unlock, err := s.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	es, err := os.ReadDir(s.Dir)
 	if err != nil {
 		return nil, err
 	}
@@ -248,39 +321,53 @@ func (s Sessions) List(ctx context.Context) ([]SessionInfo, error) {
 			continue
 		}
 		f, ok, err := s.read(host)
-		if err != nil || !ok {
-			continue
-		}
-		if s.now().Sub(f.Used) > SessionTTL {
-			if err := s.Forget(ctx, host); err != nil {
+		if errors.Is(err, ErrInvalid) || ok && s.now().Sub(f.Used) > SessionTTL {
+			// One that can't be read, or expired, is forgotten.
+			if err := s.forget(ctx, host); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		out = append(out, f.SessionInfo)
+		if ok {
+			out = append(out, f.SessionInfo)
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Host < out[j].Host })
 	return out, nil
 }
 
-// ForgetAll removes every session: each file and its key, then the
-// folder's other files (a session whose key has gone).
+// ForgetAll removes every session: each file and its key, the files of
+// sessions whose key has gone, and the folder if nothing else is in it.
+// It removes only what Sessions writes, never anything else in Dir
+// (review 53: a mistaken folder would have lost everything in it).
 func (s Sessions) ForgetAll(ctx context.Context) error {
-	es, err := os.ReadDir(s.Dir)
-	if errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(s.Dir); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+	unlock, err := s.lock()
 	if err != nil {
 		return err
 	}
+	es, err := os.ReadDir(s.Dir)
+	if err != nil {
+		unlock()
+		return err
+	}
 	for _, e := range es {
-		if host, ok := strings.CutSuffix(e.Name(), ".session"); ok && checkHost(host) == nil {
-			if err := s.Forget(ctx, host); err != nil {
+		name := e.Name()
+		if host, ok := strings.CutSuffix(name, ".session"); ok && checkHost(host) == nil {
+			if err := s.forget(ctx, host); err != nil {
+				unlock()
 				return err
 			}
+		} else if strings.HasPrefix(name, ".session-") {
+			os.Remove(filepath.Join(s.Dir, name))
 		}
 	}
-	return os.RemoveAll(s.Dir)
+	unlock()
+	os.Remove(filepath.Join(s.Dir, ".lock"))
+	os.Remove(s.Dir) // only if nothing else is in it
+	return nil
 }
 
 // ForHost is a storage state cut to host alone, matched exactly: its

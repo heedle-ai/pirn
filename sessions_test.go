@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,9 +53,14 @@ func TestInv_SessionsAreSealed(t *testing.T) {
 	// Without its key, or with another, it doesn't open.
 	saved := v[key]
 	v[key] = strings.Repeat("A", 43)
-	if _, ok, err := s.Load(ctx, "forms.example.org"); ok || err == nil {
-		t.Error("opened with another key")
+	if _, ok, err := s.Load(ctx, "forms.example.org"); ok || err != nil {
+		t.Errorf("opened with another key: %v %v", ok, err)
 	}
+	if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a file that doesn't open with its key is still there: every step on the site would fail (review 53)")
+	}
+	os.WriteFile(file, b, 0o600)
+	v[key] = saved
 	// Without its key (heedle secret delete --all), it is nothing: it
 	// doesn't open, and the file is forgotten too.
 	delete(v, key)
@@ -69,8 +75,11 @@ func TestInv_SessionsAreSealed(t *testing.T) {
 	// Moved to another host's name, it doesn't open for that host.
 	os.WriteFile(filepath.Join(s.Dir, "evil.example.org.session"), []byte(strings.Replace(string(b), `"host":"forms.example.org"`, `"host":"evil.example.org"`, 1)), 0o600)
 	v[pirn.SessionKey("evil.example.org")] = saved
-	if _, ok, err := s.Load(ctx, "evil.example.org"); ok || err == nil {
-		t.Error("a session opened for another host")
+	if _, ok, err := s.Load(ctx, "evil.example.org"); ok || err != nil {
+		t.Errorf("a session opened for another host: %v %v", ok, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.Dir, "evil.example.org.session")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a file that doesn't open is still there: the site would be stuck")
 	}
 	// Forget: both the file and the key.
 	if err := s.Forget(ctx, "forms.example.org"); err != nil {
@@ -86,7 +95,8 @@ func TestInv_SessionsAreSealed(t *testing.T) {
 	s.Save(ctx, "forms.example.org", []byte(state))
 	s.Save(ctx, "shop.example.org", []byte(state))
 	*now = now.Add(20 * 24 * time.Hour)
-	s.Load(ctx, "shop.example.org") // used: its thirty days start again
+	s.Touch(ctx, "shop.example.org") // used: its thirty days start again
+	s.Load(ctx, "forms.example.org") // looked at, not used: no more days
 	*now = now.Add(11 * 24 * time.Hour)
 	list, err := s.List(ctx)
 	if err != nil || len(list) != 1 || list[0].Host != "shop.example.org" {
@@ -98,12 +108,29 @@ func TestInv_SessionsAreSealed(t *testing.T) {
 	if _, ok, _ := s.Load(ctx, "forms.example.org"); ok {
 		t.Error("an expired session loaded")
 	}
-	// Forget all: every file and key.
+	// Forget all: every file and key, and only what Sessions wrote
+	// (review 53: a mistaken folder would have lost everything in it).
 	if err := s.ForgetAll(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(s.Dir); !errors.Is(err, os.ErrNotExist) {
 		t.Error("the folder is still there")
+	}
+	home := t.TempDir()
+	os.WriteFile(filepath.Join(home, "notes.txt"), []byte("mine"), 0o644)
+	other := pirn.Sessions{Dir: home, Vault: v}
+	other.Save(ctx, "forms.example.org", []byte(state))
+	if err := other.ForgetAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(home, "notes.txt")); err != nil || string(b) != "mine" {
+		t.Error("forgetting every sign-in removed a file that wasn't one")
+	}
+	// A folder that is a link to elsewhere is refused.
+	link := filepath.Join(t.TempDir(), "link")
+	os.Symlink(t.TempDir(), link)
+	if err := (pirn.Sessions{Dir: link, Vault: v}).Save(ctx, "forms.example.org", []byte(state)); err == nil {
+		t.Error("kept a sign-in through a link")
 	}
 	for k := range v {
 		if pirn.IsSessionName(k) {
@@ -117,26 +144,33 @@ func TestInv_SessionsAreSealed(t *testing.T) {
 	}
 }
 
-// TestInv_SessionLoadsOnlyForItsHost: a step starts signed in only on its
-// own hosts that have a kept sign-in, matched exactly: never a parent
-// domain's, a sub-domain's or a look-alike's; only that host's cookies and
-// storage go in; the record names the hosts, never what they hold; and a
-// step signed in as the person can't send without asking (roadmap 9.11).
+// TestInv_SessionLoadsOnlyForItsHost: a step starts signed in only on the
+// hosts its program names (:signed-in), each one of its own, with a kept
+// sign-in, matched exactly: never a parent domain's, a sub-domain's or a
+// look-alike's, and never a host its program doesn't name, even one with a
+// kept sign-in (review 53: a schedule made before the sign-in was kept
+// would have started signed in, unannounced). Only that host's cookies and
+// storage go in, and their file leaves the container once the browser
+// has them; what they hold is hidden wherever a page shows it; the record
+// names the hosts, never what they hold; and a step signed in as the
+// person can't send without asking (roadmap 9.11).
 func TestInv_SessionLoadsOnlyForItsHost(t *testing.T) {
 	ctx := context.Background()
-	s, _, _ := newSessions(t)
-	for _, h := range []string{"forms.example.org", "example.org", "sub.forms.example.org", "notforms.example.org"} {
+	s, _, now := newSessions(t)
+	for _, h := range []string{"forms.example.org", "example.org", "sub.forms.example.org", "notforms.example.org", "cdn.example.org"} {
 		st := strings.ReplaceAll(state, "forms.example.org", h)
 		if err := s.Save(ctx, h, []byte(st)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	api := newActAPI(t, actTurn("end_turn", `{"type":"text","text":"Done.\nResult: finished"}`))
+	*now = now.Add(time.Hour)
+	t.Setenv("FAKE_ECHO", "- text: Your session: s3cr3t-cookie")
+	api := newActAPI(t, actTurn("tool_use", browserUse("t1", "browser_snapshot", `{}`)), actTurn("end_turn", `{"type":"text","text":"Done.\nResult: finished"}`))
 	a, b := newAct(t, api)
 	a.Sessions = s
-	res, err := a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer", Allow: []string{"cdn.example.org"}})
-	if err != nil || strings.Join(res.SignedIn, " ") != "forms.example.org" {
-		t.Fatalf("%v %v", err, res.SignedIn)
+	res, err := a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer", Allow: []string{"cdn.example.org"}, SignedIn: []string{"forms.example.org"}})
+	if err != nil || strings.Join(res.SignedIn, " ") != "forms.example.org" || strings.Join(b.last.signed, " ") != "forms.example.org" || !b.last.dropped {
+		t.Fatalf("%v %v, dropped %v", err, res.SignedIn, b.last.dropped)
 	}
 	var loaded struct {
 		Cookies []struct{ Domain string }
@@ -148,21 +182,47 @@ func TestInv_SessionLoadsOnlyForItsHost(t *testing.T) {
 	}
 	out, _ := json.Marshal(res)
 	sent, _ := json.Marshal(api.reqs)
-	if strings.Contains(string(out), "s3cr3t") || strings.Contains(string(sent), "s3cr3t") || !strings.Contains(string(out), `"signedIn":["forms.example.org"]`) {
+	if strings.Contains(string(out), "s3cr3t") || strings.Contains(string(sent), "s3cr3t") || !strings.Contains(string(out), `"signedIn":["forms.example.org"]`) || !strings.Contains(string(sent), pirn.SignInPlaceholder) {
 		t.Errorf("record %s", out)
 	}
-	// A step with none of those hosts starts with none.
-	a, b = newAct(t, newActAPI(t, actTurn("end_turn", `{"type":"text","text":"x"}`)))
-	a.Sessions = s
-	if res, err := a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://shop.example.org/"}); err != nil || res.SignedIn != nil || b.last.storage != nil {
-		t.Errorf("%v %v %s", err, res.SignedIn, b.last.storage)
+	if list, _ := s.List(ctx); list[2].Host != "forms.example.org" || !list[2].Used.Equal(now.UTC()) || !list[0].Used.Before(now.UTC()) {
+		t.Errorf("used: %+v", list)
 	}
-	// Signed in, it can't send without asking: nothing starts.
+	// A program that doesn't name its hosts starts signed out, with a kept
+	// sign-in on each of them.
 	a, b = newAct(t, newActAPI(t, actTurn("end_turn", `{"type":"text","text":"x"}`)))
 	a.Sessions = s
-	_, err = a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/", SendFreely: true})
-	if !errors.Is(err, pirn.ErrInvalid) || !strings.Contains(err.Error(), "can't send without asking") || b.got.URL != "" {
-		t.Errorf("%v, browser %v", err, b.got)
+	if res, err := a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/", Allow: []string{"cdn.example.org"}}); err != nil || res.SignedIn != nil || b.last.storage != nil {
+		t.Errorf("unnamed: %v %v %s", err, res.SignedIn, b.last.storage)
+	}
+	// Named, but not one of its hosts; or with :send-without-asking:
+	// nothing starts.
+	for name, q := range map[string]pirn.ActQuestion{
+		"another host":    {Instruction: "x", URL: "https://shop.example.org/", SignedIn: []string{"forms.example.org"}},
+		"sending unasked": {Instruction: "x", URL: "https://forms.example.org/", SendFreely: true, SignedIn: []string{"forms.example.org"}},
+	} {
+		a, b = newAct(t, newActAPI(t, actTurn("end_turn", `{"type":"text","text":"x"}`)))
+		a.Sessions = s
+		if _, err := a.Run(ctx, q); !errors.Is(err, pirn.ErrInvalid) || b.got.URL != "" {
+			t.Errorf("%s: %v, browser %v", name, err, b.got)
+		}
+	}
+	// The option, as a program writes it.
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"x", "https://forms.example.org/", pirn.SignedIn, "FORMS.example.org forms.example.org"}, "forms.example.org"},
+		{[]string{"x", "https://forms.example.org/", "cdn.example.org", pirn.SignedIn, "cdn.example.org forms.example.org"}, "cdn.example.org forms.example.org"},
+		{[]string{"x", "https://forms.example.org/", pirn.SignedIn, "shop.example.org"}, "!"},
+		{[]string{"x", "https://forms.example.org/", pirn.SignedIn, "forms.example.org", pirn.SendFreely}, "!"},
+		{[]string{"x", "https://forms.example.org/", pirn.SignedIn}, "!"},
+		{[]string{"x", "https://forms.example.org/", pirn.SignedIn, "forms.example.org."}, "!"},
+	} {
+		got, ok := pirn.ActSignedIn(c.args)
+		if w := strings.Join(got, " "); c.want == "!" && ok || c.want != "!" && (!ok || w != c.want) {
+			t.Errorf("%q: %q %v", c.args, w, ok)
+		}
 	}
 	// A storage state cut to a host keeps nothing of any other.
 	if _, ok := pirn.ForHost([]byte(`{"cookies":[{"domain":".example.org"}],"origins":[{"origin":"https://evil.example.org"}]}`), "forms.example.org"); ok {
@@ -182,7 +242,7 @@ func TestInv_PersonKeepsTheirSignIn(t *testing.T) {
 			actTurn("end_turn", `{"type":"text","text":"Done.\nResult: finished"}`))
 		a, _ := newAct(t, api)
 		a.Sessions = s
-		driver(t, &a, func(w *pirn.Wheel) { w.HandBack(keep) })
+		driver(t, &a, func(w *pirn.Wheel) { w.HandBack(keep, "forms.example.org") })
 		res, err := a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer"})
 		if err != nil {
 			t.Fatal(err)
@@ -207,9 +267,91 @@ func TestInv_PersonKeepsTheirSignIn(t *testing.T) {
 			t.Error("a sign-in is in the record or Claude's requests")
 		}
 	}
+	// The browser is on a site other than the one the person saw: nothing
+	// kept, and the record says why (review 53).
+	for name, c := range map[string]struct {
+		saw    string
+		freely bool
+	}{"another site": {"accounts.example.org", false}, "sending unasked": {"forms.example.org", true}} {
+		s, _, _ := newSessions(t)
+		api := newActAPI(t, actTurn("tool_use", browserUse("t1", "browser_navigate", `{"url":"https://forms.example.org/volunteer"}`)), actTurn("tool_use", askPerson),
+			actTurn("end_turn", `{"type":"text","text":"Done.\nResult: finished"}`))
+		a, _ := newAct(t, api)
+		a.Sessions = s
+		driver(t, &a, func(w *pirn.Wheel) { w.HandBack(true, c.saw) })
+		res, err := a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer", Allow: []string{"accounts.example.org"}, SendFreely: c.freely})
+		if list, _ := s.List(ctx); err != nil || len(list) != 0 || res.Kept != "" || res.NotKept == "" {
+			t.Errorf("%s: %v kept %+v, record %q %q", name, err, list, res.Kept, res.NotKept)
+		}
+	}
+	// A keep sent after the hand-back changes nothing.
+	var late *pirn.Wheel
+	s, _, _ := newSessions(t)
+	api := newActAPI(t, actTurn("tool_use", browserUse("t1", "browser_navigate", `{"url":"https://forms.example.org/volunteer"}`)), actTurn("tool_use", askPerson),
+		actTurn("end_turn", `{"type":"text","text":"Done.\nResult: finished"}`))
+	a, _ := newAct(t, api)
+	a.Sessions = s
+	driver(t, &a, func(w *pirn.Wheel) { late = w; w.HandBack(false, "") })
+	res, _ := a.Run(ctx, pirn.ActQuestion{Instruction: "x", URL: "https://forms.example.org/volunteer"})
+	late.HandBack(true, "forms.example.org")
+	if list, _ := s.List(ctx); len(list) != 0 || res.Kept != "" {
+		t.Errorf("a late keep kept %+v", list)
+	}
 	// No connector may name a session's key.
 	err := pirn.Connectors{{Name: "x", URL: "https://x.example/mcp", TokenEnv: pirn.SessionKey("forms.example.org")}}.Check()
 	if err == nil {
 		t.Error("a connector named a session's key")
 	}
+}
+
+// TestInv_SessionsDontRace: steps and the UI keeping, loading, using and
+// forgetting the same site's sign-in at once never leave a file that
+// doesn't open with its key (review 53).
+func TestInv_SessionsDontRace(t *testing.T) {
+	ctx := context.Background()
+	s, v, _ := newSessions(t)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	vault := lockedVault{v: v, mu: &mu}
+	s.Vault = vault
+	for i := 0; i < 20; i++ {
+		wg.Add(4)
+		go func() { defer wg.Done(); s.Save(ctx, "forms.example.org", []byte(state)) }()
+		go func() { defer wg.Done(); s.Load(ctx, "forms.example.org") }()
+		go func() { defer wg.Done(); s.Touch(ctx, "forms.example.org") }()
+		go func() {
+			defer wg.Done()
+			if i%5 == 0 {
+				s.Forget(ctx, "forms.example.org")
+			}
+		}()
+	}
+	wg.Wait()
+	s.Save(ctx, "forms.example.org", []byte(state))
+	s.Touch(ctx, "forms.example.org")
+	if got, ok, err := s.Load(ctx, "forms.example.org"); err != nil || !ok || string(got) != state {
+		t.Errorf("after racing: %v %v", ok, err)
+	}
+}
+
+// lockedVault is a memVault safe to use at once.
+type lockedVault struct {
+	v  memVault
+	mu *sync.Mutex
+}
+
+func (l lockedVault) Lookup(ctx context.Context, n string) (string, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.v.Lookup(ctx, n)
+}
+func (l lockedVault) Store(ctx context.Context, n, val string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.v.Store(ctx, n, val)
+}
+func (l lockedVault) Delete(ctx context.Context, n string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.v.Delete(ctx, n)
 }
