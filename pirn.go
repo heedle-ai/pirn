@@ -181,6 +181,8 @@ func (c Claude) Ask(ctx context.Context, q Question) (Answer, error) {
 	if err != nil {
 		return Answer{}, classify(ctx, err)
 	}
+	// Counted as soon as Claude answers (roadmap 10.4.1).
+	MeterFrom(ctx).Add(Call{Model: string(msg.Model), Input: msg.Usage.InputTokens, Output: msg.Usage.OutputTokens})
 	var text strings.Builder
 	for _, b := range msg.Content {
 		if b.Type == "text" {

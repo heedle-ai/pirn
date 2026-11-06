@@ -60,6 +60,7 @@ func TestInv_OnlyTheSDKTalksToClaude(t *testing.T) {
 				"heartbeat.go": {"sync"},
 				"profile.go":   {"slices", "unicode", "html", "net/url"},       // checking and hiding details (roadmap 9.8, review 42)
 				"replay.go":    {"github.com/modelcontextprotocol/go-sdk/mcp"}, // reading the page a replay checks (roadmap 9.9)
+				"meter.go":     {"sync"},                                       // calls noted from concurrent requests (roadmap 10.4.1)
 			}
 			if !allowed[p] && !slices.Contains(except[f], p) {
 				bad = append(bad, f+": "+p)

@@ -373,6 +373,9 @@ func (a Agent) ask(ctx context.Context, client anthropic.Client, tb *toolbox, ms
 		msg, err := client.Beta.Messages.New(cctx, params)
 		cancel()
 		if err == nil {
+			// Counted as soon as Claude answers, whatever becomes of the
+			// step (roadmap 10.4.1).
+			MeterFrom(ctx).Add(Call{Model: string(msg.Model), Input: msg.Usage.InputTokens, Output: msg.Usage.OutputTokens})
 			return msg, nil
 		}
 		err = classify(ctx, err)
